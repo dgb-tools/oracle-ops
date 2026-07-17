@@ -1,0 +1,20 @@
+{
+  "oracle_id": 0,
+  "oracle_wallet": "oracle",
+  "cli_exe": "C:\\Program Files\\DigiByte\\daemon\\digibyte-cli.exe",
+  "datadir": "C:\\Users\\YOURUSER\\AppData\\Roaming\\DigiByte",
+  "monitor_testnet": true,
+  "monitor_mainnet": true,
+
+  "ntfy_server": "https://ntfy.sh",
+  "ntfy_topic": "PICK-A-LONG-RANDOM-TOPIC-NAME",
+
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "webhook_url": "",
+
+  "realert_hours": 6,
+  "heartbeat_enabled": true,
+  "heartbeat_hour": 9,
+  "min_free_disk_gb": 15
+}
