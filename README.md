@@ -40,15 +40,54 @@ subscribe to your topic, done), Telegram bot, or any webhook.
 **Read-only by design:** status RPCs only. It never touches keys, wallets, or
 passphrases — your passphrase is typed by you, at a keyboard, or not at all.
 
-## Quick start (Windows)
+## Set it up (~10 minutes — start with your phone)
+
+The monitor runs on the same Windows box as your node and oracle, and pages your
+phone through [ntfy](https://ntfy.sh) — a free, open-source push service. No account
+needed anywhere: a private topic name is the entire channel.
+
+**1. Install the *official* ntfy app** (there are lookalikes in both stores — use
+these exact links; the real one is by Philipp Heckel, package `io.heckel.ntfy`):
+
+- **Android:** [Google Play](https://play.google.com/store/apps/details?id=io.heckel.ntfy) · [F-Droid](https://f-droid.org/packages/io.heckel.ntfy/)
+- **iPhone:** [App Store](https://apps.apple.com/app/ntfy/id1625396347)
+- Project: [github.com/binwiederhier/ntfy](https://github.com/binwiederhier/ntfy) · [docs.ntfy.sh](https://docs.ntfy.sh)
+
+Allow notifications when the app asks.
+
+**2. Invent your private topic name** — long and random, like
+`dgb-oracle7-k3x9v2m8q4w6`. **The topic is a password:** anyone who knows it can read
+your alert stream *and send you fake alerts*. Don't pick anything guessable, don't
+post it anywhere. (`install.ps1` suggests a random one if you leave the placeholder.)
+
+**3. Subscribe your phone:** ntfy app → **+** (Add subscription) → server `ntfy.sh` →
+enter your topic → subscribe. Then add ntfy to your Do-Not-Disturb / sleep-focus
+exceptions — a 3 a.m. page that politely respects DND is a diary entry, not an alert.
+
+**4. On the oracle box** — clone or [download](https://github.com/dgb-tools/oracle-ops/archive/refs/heads/main.zip) this repo anywhere (e.g. `C:\oracle-ops`):
 
 ```powershell
-cd monitor
+cd oracle-ops\monitor
 copy config.json.example config.json
-# edit config.json: your slot id, paths, and a LONG RANDOM ntfy topic name
-# (anyone who knows the topic can read your alerts — treat it like a password)
-.\install.ps1        # elevated: creates the 5-min scheduled task + sends a test alert
+notepad config.json    # set: oracle_id, oracle_wallet, cli_exe, datadir, ntfy_topic
 ```
+
+**5. Install** (elevated PowerShell):
+
+```powershell
+.\install.ps1          # creates the 5-min scheduled task + fires a test alert
+```
+
+**6. Verify:** the test alert should hit your phone within seconds. If it doesn't:
+check the app's subscription topic matches `config.json` exactly, and that
+notifications are allowed. You can also watch the raw stream in any browser at
+`https://ntfy.sh/<your-topic>`.
+
+From then on: red alerts only when something is actually wrong (with the fix commands
+in the message body), a green **RECOVERED** notice when it clears, re-alerts every
+`realert_hours` while a problem persists, and one quiet daily heartbeat so silence
+never means "the monitor died." Prefer Telegram or a webhook instead of ntfy? Both
+supported — see `config.json.example`.
 
 **Supported today: Windows (PowerShell 5.1+, scheduled task).** One trap for anyone
 extending the script: PowerShell **aliases outrank functions** — a function named
