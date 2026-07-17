@@ -83,12 +83,15 @@ function Report-Check([string]$Key, [bool]$Ok, [string]$Title, [string]$Body, [s
 }
 
 # ---------- digibyte-cli ----------
-function Cli([string[]]$Net, [string[]]$CmdArgs) {
+# NOTE: do not name a function `Cli` — `cli` is a built-in PowerShell alias for
+# Clear-Item, and aliases outrank functions, so every call would silently invoke
+# Clear-Item instead. Verb-Noun names sidestep the entire alias table.
+function Invoke-DgbCli([string[]]$Net, [string[]]$CmdArgs) {
   & $CliExe "-datadir=$DataDir" @Net @CmdArgs 2>$null
 }
-function CliJson([string[]]$Net, [string[]]$CmdArgs) {
-  try { $raw = (Cli $Net $CmdArgs) -join "`n"; if ($raw) { $raw | ConvertFrom-Json } else { $null } }
-  catch { $null }
+function Get-DgbJson ([string[]]$Net, [string[]]$CmdArgs) {
+  try { $raw = (Invoke-DgbCli $Net $CmdArgs) -join "`n"; if ($raw) { $raw | ConvertFrom-Json } else { Log "CLIJSON-EMPTY net=[$($Net -join ',')] cmd=[$($CmdArgs -join ',')]"; $null } }
+  catch { Log "CLIJSON-ERR net=[$($Net -join ',')] cmd=[$($CmdArgs -join ',')]: $($_.Exception.Message)"; $null }
 }
 
 # ---------- per-chain checks ----------
@@ -99,12 +102,12 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
           Where-Object { $_.CommandLine -match $ProcPattern }
   Report-Check "$Label-daemon" ([bool]$proc) "DGB oracle box: $Label daemon DOWN" `
     "digibyted ($Label) is not running. If a scheduled task should restart it and this repeats, log in and investigate." 'urgent'
-  if (-not $proc) { return ,@("$Label: DAEMON DOWN") }
+  if (-not $proc) { return ,@("${Label}: DAEMON DOWN") }
 
-  $bc = CliJson $Net @('getblockchaininfo')
+  $bc = Get-DgbJson $Net @('getblockchaininfo')
   Report-Check "$Label-rpc" ([bool]$bc) "DGB oracle box: $Label RPC unreachable" `
     "Daemon process exists but RPC is not answering (may be starting up / verifying blocks)." 'high'
-  if (-not $bc) { return ,@("$Label: RPC not answering") }
+  if (-not $bc) { return ,@("${Label}: RPC not answering") }
 
   $lag = [int64]$bc.headers - [int64]$bc.blocks
   $tipTime = 0; if ($bc.PSObject.Properties['time']) { $tipTime = [int64]$bc.time } else { $tipTime = [int64]$bc.mediantime }
@@ -114,7 +117,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     "blocks=$($bc.blocks) headers=$($bc.headers) ibd=$($bc.initialblockdownload) tip_age_sec=$tipAge" 'high'
   $summary += "$Label h=$($bc.blocks)"
 
-  $wallets = CliJson $Net @('listwallets')
+  $wallets = Get-DgbJson $Net @('listwallets')
   $wLoaded = $wallets -contains $Cfg.oracle_wallet
   Report-Check "$Label-wallet" $wLoaded "DGB oracle box: $Label wallet '$($Cfg.oracle_wallet)' NOT LOADED" `
     "listwallets does not include '$($Cfg.oracle_wallet)'. Check settings.json autoload; loadwallet to fix." 'urgent'
@@ -122,7 +125,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
   # Oracle checks (mainnet: only once DigiDollar is active)
   $ddActive = $true
   if ($IsMainnet) {
-    $dep = CliJson $Net @('getdigidollardeploymentinfo')
+    $dep = Get-DgbJson $Net @('getdigidollardeploymentinfo')
     if ($dep) {
       $ddActive = ($dep.status -eq 'active')
       $prev = ''; if ($State.ContainsKey('mainnet-dd-status')) { $prev = $State['mainnet-dd-status'] }
@@ -143,7 +146,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
   }
 
   if ($ddActive) {
-    $roster = CliJson $Net @('getoracles', 'false')
+    $roster = Get-DgbJson $Net @('getoracles', 'false')
     $me = $null
     if ($roster) { $me = $roster | Where-Object { $_.oracle_id -eq $OracleId } }
     $reporting = $me -and ($me.status -eq 'reporting') -and $me.is_running_locally -and
@@ -153,7 +156,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
 
     $body = "$Label oracle $OracleId is not signing. $detail"
     if ($wLoaded) {
-      $wi = CliJson ($Net + "-rpcwallet=$($Cfg.oracle_wallet)") @('getwalletinfo')
+      $wi = Get-DgbJson ($Net + "-rpcwallet=$($Cfg.oracle_wallet)") @('getwalletinfo')
       if ($wi -and ($wi.PSObject.Properties['unlocked_until']) -and ($wi.unlocked_until -eq 0) -and $IsMainnet) {
         $body += ("`nWallet is LOCKED (likely after a reboot). Fix:`n" +
                   "digibyte-cli -testnet=0 -chain=main -rpcwallet=$($Cfg.oracle_wallet) walletpassphrase `"<passphrase>`" <seconds>`n" +
@@ -196,7 +199,7 @@ try {
       $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/DigiByte-Core/digibyte/releases/latest' `
         -Headers @{ 'User-Agent' = 'dgb-oracle-monitor' } -UseBasicParsing
       $netArgs = $MainArgs; if (-not $Cfg.monitor_mainnet) { $netArgs = $TestArgs }
-      $ni = CliJson $netArgs @('getnetworkinfo')
+      $ni = Get-DgbJson $netArgs @('getnetworkinfo')
       if ($rel.tag_name -match '(\d+\.\d+\.\d+)') { $latest = [version]$Matches[1] } else { $latest = $null }
       $local = $null
       if ($ni -and $ni.subversion -match '(\d+\.\d+\.\d+)') { $local = [version]$Matches[1] }

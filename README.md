@@ -50,7 +50,11 @@ copy config.json.example config.json
 .\install.ps1        # elevated: creates the 5-min scheduled task + sends a test alert
 ```
 
-**Supported today: Windows (PowerShell 5.1+, scheduled task).** Linux/macOS
+**Supported today: Windows (PowerShell 5.1+, scheduled task).** One trap for anyone
+extending the script: PowerShell **aliases outrank functions** — a function named
+`Cli` silently invokes the built-in `cli` alias (Clear-Item) instead of itself, and
+`"$var: text"` in double quotes parses the colon as scope syntax (use `"${var}:"`).
+Both were found the hard way on a live deployment; stick to Verb-Noun names. Linux/macOS
 operators: the checks are a direct translation (`getblockchaininfo`, `listwallets`,
 `getoracles`, `getdigidollardeploymentinfo` + curl to ntfy, under cron/systemd). PRs
 welcome — this repo would happily carry a bash twin.
