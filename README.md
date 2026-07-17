@@ -50,8 +50,9 @@ copy config.json.example config.json
 .\install.ps1        # elevated: creates the 5-min scheduled task + sends a test alert
 ```
 
-Linux/macOS operators: the checks are a direct translation (`getblockchaininfo`,
-`listwallets`, `getoracles`, `getdigidollardeploymentinfo` + curl to ntfy). PRs
+**Supported today: Windows (PowerShell 5.1+, scheduled task).** Linux/macOS
+operators: the checks are a direct translation (`getblockchaininfo`, `listwallets`,
+`getoracles`, `getdigidollardeploymentinfo` + curl to ntfy, under cron/systemd). PRs
 welcome — this repo would happily carry a bash twin.
 
 ## The runbook

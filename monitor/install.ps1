@@ -8,6 +8,19 @@ if (-not (Test-Path "$here\config.json")) {
   exit 1
 }
 
+# The ntfy topic is effectively a password: anyone who knows it can read your alert
+# stream and spoof alerts to you. Refuse to install with the placeholder still set.
+$cfg = Get-Content "$here\config.json" -Raw | ConvertFrom-Json
+if (-not $cfg.ntfy_topic -or $cfg.ntfy_topic -eq 'PICK-A-LONG-RANDOM-TOPIC-NAME') {
+  $suggested = "dgb-oracle$($cfg.oracle_id)-" + ((1..24 | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }) -join '')
+  Write-Error "Set a private ntfy_topic in config.json first. Suggested random topic:`n  $suggested`nSubscribe to it in the ntfy app, then re-run install."
+  exit 1
+}
+if ($cfg.oracle_id -eq 0) {
+  Write-Error "Set your oracle_id in config.json (slot 0 is not a valid slot)."
+  exit 1
+}
+
 $action = "powershell -NoProfile -ExecutionPolicy RemoteSigned -File `"$here\oracle-monitor.ps1`""
 schtasks /create /tn "DigiByteOracleMonitor" /tr $action /sc minute /mo 5 /ru SYSTEM /rl HIGHEST /f
 if ($LASTEXITCODE -ne 0) { Write-Error "schtasks failed."; exit 1 }
