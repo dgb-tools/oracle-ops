@@ -53,9 +53,9 @@ digibyte-cli -testnet=0 -chain=main getoracles false
 
 ## Prevention
 
-- **Stop the daemon cleanly before any planned reboot** — recommended (untested by
-  us, but standard node behavior: a clean stop flushes the chainstate, avoiding the
-  rollback and re-validation entirely):
+- **Stop the daemon cleanly before any planned reboot** — proven on our box during
+  the v9.26.5 upgrade (see the upgrade section below): a clean stop flushes the
+  chainstate, avoiding the rollback and re-validation entirely:
   ```
   digibyte-cli -testnet=0 -chain=main stop
   digibyte-cli -testnet stop        # if you run both chains
@@ -73,6 +73,41 @@ digibyte-cli -testnet=0 -chain=main getoracles false
 - **Run the monitor** so a dark slot pages you instead of waiting for someone in the
   community to notice. On testnet, 19 of 35 slots sat dark for days-to-weeks at one
   point — nobody was told.
+
+## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
+
+Total slot-29 downtime for a two-chain upgrade on our box: **~25 minutes**, zero
+rollback, zero re-validation. The entire trick is stopping cleanly BEFORE the
+installer runs — this supersedes reboot-and-revalidate as the maintenance path:
+
+```
+# 1. Download the new installer and verify its hash BEFORE touching the node.
+#    (v9.26.5 Windows asset, self-recorded — the release published no checksums:
+#    SHA256 880CDD2CC3CABCC838AEA6045647D7FD4AC4CA95BE25FD808C939641386B9325)
+
+# 2. Stop BOTH chains cleanly:
+digibyte-cli -testnet=0 -chain=main stop
+digibyte-cli -testnet stop
+
+# 3. WAIT for the clean flush — 2–4 minutes with a big dbcache. The log line you
+#    want is "Shutdown: done". Never kill the process: that converts your clean
+#    upgrade into the hard-reboot scenario at the top of this runbook.
+
+# 4. Run the installer over the old binaries; restart your tasks/daemons.
+
+# 5. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above).
+```
+
+Because the clean stop flushes the chainstate, the mainnet tip never drops below
+the DigiDollar activation height — the misleading "DigiDollar is not yet active"
+window never opens. On our box the oracle auto-started the moment the encrypted
+wallet was unlocked; treat that as a bonus, observed once, and still verify with
+`getoracles`.
+
+**Why v9.26.5 is worth the 25 minutes:** its headline fix caches versionbits
+state, cutting the mainnet oracle startup scan from ~15 minutes to seconds —
+every future restart, planned or otherwise, gets cheaper. No consensus change,
+no coordination deadline; drop-in binaries.
 
 ## Known network-level nuance (activation week)
 

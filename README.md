@@ -102,8 +102,13 @@ welcome — this repo would happily carry a bash twin.
 
 [runbook.md](runbook.md) — what a hard reboot does to your oracle (chainstate
 rollback, the misleading "DigiDollar is not yet active" error, why auto-start won't
-resume with an encrypted wallet), the recovery procedure, and how to avoid all of it
-with a clean stop. Learned on a live slot so you don't have to.
+resume with an encrypted wallet), the recovery procedure, how to avoid all of it
+with a clean stop — and the proven two-chain **upgrade template** (v9.26.4 →
+v9.26.5 in ~25 minutes, no rollback). Learned on a live slot so you don't have to.
+
+**If you haven't upgraded yet:** v9.26.5's versionbits cache cuts the mainnet
+oracle startup scan from ~15 minutes to seconds, so every future restart gets
+cheaper. Drop-in binaries, no consensus change.
 
 ## Related
 
