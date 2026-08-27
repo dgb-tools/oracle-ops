@@ -42,9 +42,12 @@ or `git clone https://github.com/dgb-tools/oracle-ops`.
 
 Both fire a test alert — if your phone buzzes, you're done.
 
-**6. Prove it (1 min, recommended).** Kill your daemon on purpose
-(`taskkill /f /im digibyted.exe` / `sudo systemctl kill digibyted`). Within ~5
-minutes: the daemon is back, and your phone explains what happened. If your
+**6. Prove it (1 min, recommended).** Kill your daemon on purpose — a *hard*
+kill, simulating a crash: `taskkill /f /im digibyted.exe` on Windows,
+`sudo systemctl kill -s SIGKILL digibyted` on Linux. (A plain `systemctl
+kill` sends SIGTERM — the clean-stop path, which can sit in the shutdown
+timeout instead of demonstrating crash recovery.) Within ~5 minutes: the
+daemon is back, and your phone explains what happened. If your
 oracle wallet is encrypted, the alert also reminds you the ORACLE needs a
 manual unlock — that's by design, not a bug.
 

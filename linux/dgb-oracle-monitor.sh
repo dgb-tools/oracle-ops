@@ -58,7 +58,8 @@ report_check() { # key ok(1|0) title body [priority]
   local key="$1" ok="$2" title="$3" body="$4" prio="${5:-high}"
   local f="$STATE/down_$key" last=0
   if [ "$ok" != "1" ]; then
-    [ -f "$f" ] && last=$(cat "$f")
+    [ -f "$f" ] && last=$(cat "$f" 2>/dev/null)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac   # empty/garbage state file -> re-alert, never crash
     if [ $((NOW - last)) -ge $((REALERT_HOURS * 3600)) ]; then
       notify "$title" "$body" "$prio" rotating_light
       echo "$NOW" > "$f"
@@ -139,10 +140,29 @@ No systemd service configured - log in and start the daemon, or install digibyte
   report_check "$label-daemon" 1 "" ""
   report_check "$label-rpc" 1 "" ""
 
+  # Extract with `// empty` and verify numeric BEFORE any arithmetic: a
+  # partial or malformed getblockchaininfo must degrade to an alert, never
+  # crash this subshell (a crashed subshell would log a healthy-looking PASS
+  # in the parent - found in crew review under a mocked CLI).
   local blocks headers ibd tiptime lag tipage synced=0
-  blocks=$(jq -r .blocks <<< "$bc"); headers=$(jq -r .headers <<< "$bc")
-  ibd=$(jq -r .initialblockdownload <<< "$bc")
-  tiptime=$(jq -r '.time // .mediantime' <<< "$bc")
+  blocks=$(jq -r '.blocks // empty' <<< "$bc"); headers=$(jq -r '.headers // empty' <<< "$bc")
+  # NOTE: no `// empty` on the boolean - jq's // treats false as absent and
+  # would swallow a legitimate ibd=false (found by the mock test). Plain
+  # extraction is safe here: only the exact string "false" counts as synced,
+  # so a missing field ("null") already fails closed, and it is never used
+  # in arithmetic.
+  ibd=$(jq -r '.initialblockdownload' <<< "$bc")
+  tiptime=$(jq -r '.time // .mediantime // empty' <<< "$bc")
+  case "$blocks"  in ''|*[!0-9]*) blocks=""  ;; esac
+  case "$headers" in ''|*[!0-9]*) headers="" ;; esac
+  case "$tiptime" in ''|*[!0-9]*) tiptime="" ;; esac
+  if [ -z "$blocks" ] || [ -z "$headers" ] || [ -z "$tiptime" ]; then
+    report_check "$label-rpcdata" 0 "DGB oracle box: $label RPC returned malformed data" \
+      "getblockchaininfo answered but blocks/headers/time were missing or non-numeric. Node may be mid-startup or the RPC output is unexpected - treating as NOT healthy." high
+    echo "$label: RPC data malformed"
+    return
+  fi
+  report_check "$label-rpcdata" 1 "" ""
   lag=$((headers - blocks)); tipage=$((NOW - tiptime))
   [ "$ibd" = "false" ] && [ "$lag" -lt 10 ] && [ "$tipage" -lt 1800 ] && synced=1
   report_check "$label-sync" "$synced" "DGB oracle box: $label node NOT SYNCED" \
@@ -223,6 +243,7 @@ if [ -n "${DAEMON_SERVICE:-}" ] && command -v systemctl >/dev/null; then
   cur=$(systemctl show "$DAEMON_SERVICE" -p NRestarts --value 2>/dev/null)
   if [ -n "$cur" ] && [ "$cur" -ge 0 ] 2>/dev/null; then
     prev=$(state_get nrestarts "$cur")
+    case "$prev" in ''|*[!0-9]*) prev="$cur" ;; esac
     if [ "$cur" -gt "$prev" ]; then
       notify "DGB daemon auto-restarted by systemd ($((cur - prev))x since last check)" \
         "The node came back on its own; verify your oracle resumed (encrypted wallets need a manual unlock).
@@ -261,7 +282,11 @@ fi
 today=$(date +%F)
 if [ "${HEARTBEAT_ENABLED:-0}" = "1" ] && [ "$(state_get hb-date '')" != "$today" ] && [ "$(date +%-H)" -ge "$HEARTBEAT_HOUR" ]; then
   state_set hb-date "$today"
-  downs=$(ls "$STATE" 2>/dev/null | grep '^down_' | sed 's/^down_//' | tr '\n' ' ')
+  downs=""
+  for f in "$STATE"/down_*; do
+    [ -e "$f" ] || continue
+    downs="$downs${f##*/down_} "
+  done
   status="all checks passing"; [ -n "$downs" ] && status="OPEN ISSUES: $downs"
   notify "DGB oracle daily heartbeat" "$status
 $PARTS" min satellite

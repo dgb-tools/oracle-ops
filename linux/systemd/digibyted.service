@@ -18,6 +18,13 @@
 Description=DigiByte daemon (DigiDollar oracle node)
 After=network-online.target
 Wants=network-online.target
+# If it crash-loops hard (5 restarts in 10 min), stop and leave the evidence.
+# The monitor alerts on "daemon DOWN" with the crash class at that point.
+# These two keys MUST live in [Unit] - in [Service] systemd ignores them
+# ("Unknown key") and Restart=always would loop forever. Verified with
+# systemd-analyze verify during crew review.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -30,10 +37,6 @@ TimeoutStopSec=600
 KillMode=process
 Restart=always
 RestartSec=15
-# If it crash-loops hard (5 restarts in 10 min), stop and leave the evidence.
-# The monitor alerts on "daemon DOWN" with the crash class at that point.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 # Basic hardening; loosen if your datadir lives somewhere exotic.
 NoNewPrivileges=true

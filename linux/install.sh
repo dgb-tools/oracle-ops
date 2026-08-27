@@ -30,6 +30,13 @@ fi
 
 chmod +x "$HERE/dgb-oracle-monitor.sh"
 
+# The monitor runs as $RUN_USER but this checkout is often root-owned (sudo
+# git clone): make sure the state dir and logs are writable by the monitor,
+# or every run fails silently from its own timer.
+mkdir -p "$HERE/state"
+touch "$HERE/monitor.log"
+chown -R "$RUN_USER" "$HERE/state" "$HERE/monitor.log"
+
 # Write units pointing at THIS checkout (no /opt copy needed).
 sed -e "s|^ExecStart=.*|ExecStart=$HERE/dgb-oracle-monitor.sh|" \
     -e "s|^User=.*|User=$RUN_USER|" \
@@ -45,12 +52,22 @@ sudo -u "$RUN_USER" "$HERE/dgb-oracle-monitor.sh" --test
 echo "If no notification arrived, check your ntfy topic subscription and config."
 echo ""
 
-# Offer the daemon auto-restart unit if the daemon isn't under systemd yet.
+# The monitor is installed - but the monitor only TELLS you the daemon died.
+# Auto-restart is the protection the August 2026 incident was about, and it
+# is a separate unit. Do not let a green test alert read as "done".
 if [ -n "${DAEMON_SERVICE:-}" ] && ! systemctl list-unit-files 2>/dev/null | grep -q "^$DAEMON_SERVICE.service"; then
-  echo "NOTE: DAEMON_SERVICE='$DAEMON_SERVICE' is set but no such systemd unit exists."
-  echo "Auto-restart is the single most important protection this kit offers."
-  echo "Edit systemd/digibyted.service (User= and paths), then:"
-  echo "  sudo cp $HERE/systemd/digibyted.service /etc/systemd/system/"
-  echo "  sudo systemctl daemon-reload && sudo systemctl enable --now digibyted"
+  echo "=================================================================="
+  echo "  WARNING - AUTO-RESTART: NOT INSTALLED"
+  echo "=================================================================="
+  echo "DAEMON_SERVICE='$DAEMON_SERVICE' is set but no such systemd unit"
+  echo "exists. Your monitor will PAGE you when the daemon dies, but nothing"
+  echo "will RESTART it - which is exactly how most oracle slots spent the"
+  echo "August 2026 incident. Finish the job:"
+  echo "  1. Edit $HERE/systemd/digibyted.service (User= and paths)"
+  echo "  2. sudo cp $HERE/systemd/digibyted.service /etc/systemd/system/"
+  echo "  3. sudo systemctl daemon-reload && sudo systemctl enable --now digibyted"
   echo "(Stop any manually-started daemon first: digibyte-cli stop)"
+  echo "=================================================================="
+else
+  echo "AUTO-RESTART: covered ('$DAEMON_SERVICE' unit present, or DAEMON_SERVICE unset by choice)."
 fi

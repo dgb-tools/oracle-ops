@@ -17,6 +17,10 @@ MONITOR_MAINNET=1
 # Used to detect and annotate automatic restarts (crash-class reporting).
 DAEMON_SERVICE="digibyted"
 
+# User the monitor timer runs as (must be able to run digibyte-cli against
+# your datadir). Defaults to "digibyte" if unset.
+#MONITOR_USER="digibyte"
+
 # --- Alerts ---------------------------------------------------------------
 # ntfy (easiest: install the ntfy app, subscribe to your topic, done).
 # THE TOPIC IS A PASSWORD: anyone who knows it can read your alert stream and
