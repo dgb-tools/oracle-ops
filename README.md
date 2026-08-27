@@ -1,24 +1,61 @@
 # oracle-ops
 
-**Tools and field notes for DigiDollar oracle operators.** A personal watchdog that
-pages *you* when *your* slot goes dark, plus an operator's runbook written from
-things that actually happened — including what a reboot really does to a running
-oracle (spoiler: more than you'd think).
+**The operator kit for DigiDollar oracle slots** — three small pieces that keep a
+slot alive without a human watching it:
+
+1. **Auto-restart** — your daemon comes back within minutes of a crash
+   (Windows scheduled task · Linux systemd), instead of staying dark until
+   someone logs in
+2. **A personal watchdog** that pages *your* phone when *your* slot stops
+   signing — and tells you *what crashed*, not just that something did
+3. **An operator's runbook** written from things that actually happened —
+   reboots, upgrades, and the August 2026 network-wide crash
 
 > Written by the operator of slot 29, live on mainnet since ~40 minutes after
 > DigiDollar activation (block 23,869,440, July 17, 2026). Independent community
-> project — not affiliated with the DigiByte Foundation.
+> project — not affiliated with the DigiByte Foundation. Free, MIT, no strings.
 
 ## Why this exists
 
 [digibyte.io](https://digibyte.io/mainnet/oracles) already has an excellent oracle
 dashboard — it shows the whole room. What it can't do is wake **you** when **your**
-slot stops signing. On testnet, 19 of 35 slots sat dark at one point, some for weeks;
-nobody was notified, because nothing existed to notify them. DigiDollar's price feed
-needs 7 of 35 signatures — every dark slot thins the margin.
+slot stops signing, and it can't restart your daemon. In the **August 26–27, 2026
+incident**, a malformed network message crashed daemons across the network:
+reporting oracles fell from ~31 of 35 to **11** (the price feed needs 7), and
+recovery took about a day — because most slots had neither auto-restart nor
+monitoring. The two boxes that came back fastest were the ones where a scheduled
+task restarted the daemon and a watchdog paged the operator. This kit is that
+setup, packaged.
 
-The monitor is the complement, not a replacement: a small watchdog on your own box,
-checking your own node, paging your own phone.
+## Keep the daemon alive (the part that matters most)
+
+**Windows** — registers the task `DigiByteOracleNode`: starts your daemon(s) at
+boot AND re-starts them within 5 minutes of any crash. It also avoids the two
+scheduler traps that bit the network in August: a boot-only trigger (first crash
+= dark until a human logs in) and the default 72-hour execution-time limit
+(Windows silently kills the task — and your daemon — three days after boot).
+
+```powershell
+cd oracle-ops\monitor          # after editing config.json (see setup below)
+.\install-node-task.ps1        # elevated PowerShell
+```
+
+**Linux** — `Restart=always` via systemd. Edit `User=` and paths first:
+
+```bash
+sudo cp linux/systemd/digibyted.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now digibyted
+```
+
+Restarts are never silent: the keeper/monitor sends a "restarted automatically"
+notice with a **crash-class read** from the log tail (oversized-message crash,
+out-of-memory, assertion, database corruption, disk full — or "no known
+signature", which is worth reporting).
+
+**Encrypted oracle wallets:** the NODE returns automatically; your ORACLE stays
+stopped until you unlock the wallet yourself (`walletpassphrase`, then
+`startoracle` — see the runbook). The monitor pages you for exactly that state.
+That trade-off is yours to pick; the kit never touches passphrases.
 
 ## What the monitor checks (every 5 minutes)
 
@@ -75,7 +112,8 @@ notepad config.json    # set: oracle_id, oracle_wallet, cli_exe, datadir, ntfy_t
 **5. Install** (elevated PowerShell):
 
 ```powershell
-.\install.ps1          # creates the 5-min scheduled task + fires a test alert
+.\install.ps1            # monitor: 5-min scheduled task + fires a test alert
+.\install-node-task.ps1  # auto-restart: the DigiByteOracleNode keeper task
 ```
 
 **6. Verify:** the test alert should hit your phone within seconds. If it doesn't:
@@ -89,14 +127,34 @@ in the message body), a green **RECOVERED** notice when it clears, re-alerts eve
 never means "the monitor died." Prefer Telegram or a webhook instead of ntfy? Both
 supported — see `config.json.example`.
 
-**Supported today: Windows (PowerShell 5.1+, scheduled task).** One trap for anyone
-extending the script: PowerShell **aliases outrank functions** — a function named
-`Cli` silently invokes the built-in `cli` alias (Clear-Item) instead of itself, and
-`"$var: text"` in double quotes parses the colon as scope syntax (use `"${var}:"`).
-Both were found the hard way on a live deployment; stick to Verb-Noun names. Linux/macOS
-operators: the checks are a direct translation (`getblockchaininfo`, `listwallets`,
-`getoracles`, `getdigidollardeploymentinfo` + curl to ntfy, under cron/systemd). PRs
-welcome — this repo would happily carry a bash twin.
+## Linux setup
+
+The bash twin lives in [`linux/`](linux/) — same checks, same alert channels,
+same dedupe/RECOVERED behavior, plus systemd-restart detection (if `NRestarts`
+grew since the last run, you get a "restarted automatically" notice with the
+crash class). Requirements: `bash`, `curl`, `jq`.
+
+```bash
+cd oracle-ops/linux
+cp config.example config
+nano config            # oracle_id, wallet, paths, ntfy topic
+sudo ./install.sh      # installs the 5-min systemd timer + fires a test alert
+```
+
+`install.sh` also walks you into installing `digibyted.service` (auto-restart)
+if your daemon isn't under systemd yet — that's the single most important
+protection in the kit.
+
+**Field-tested status, honestly:** the Windows pieces run in production on slot
+29's box and the keeper was validated against a live mainnet node. The Linux
+twin is a faithful port, syntax-checked but **not yet burned in on a live slot**
+— if you run it, your first bug report makes it better for the next operator.
+
+**A trap for anyone extending the PowerShell:** aliases outrank functions — a
+function named `Cli` silently invokes the built-in `cli` alias (Clear-Item)
+instead of itself, and `"$var: text"` in double quotes parses the colon as scope
+syntax (use `"${var}:"`). Both were found the hard way on a live deployment;
+stick to Verb-Noun names.
 
 ## The runbook
 

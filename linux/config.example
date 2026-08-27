@@ -1,0 +1,38 @@
+# dgb-oracle-monitor configuration (shell syntax: KEY="value", no spaces around =)
+# Copy to `config` in this directory and edit. `config` is gitignored.
+
+# Your oracle slot and wallet
+ORACLE_ID=0
+ORACLE_WALLET="oracle"
+
+# Paths
+CLI_EXE="/usr/local/bin/digibyte-cli"
+DATADIR="/home/digibyte/.digibyte"
+
+# Which chains this box runs
+MONITOR_TESTNET=1
+MONITOR_MAINNET=1
+
+# systemd service name for the daemon ("" if you don't run it under systemd).
+# Used to detect and annotate automatic restarts (crash-class reporting).
+DAEMON_SERVICE="digibyted"
+
+# --- Alerts ---------------------------------------------------------------
+# ntfy (easiest: install the ntfy app, subscribe to your topic, done).
+# THE TOPIC IS A PASSWORD: anyone who knows it can read your alert stream and
+# spoof alerts to you. Pick something long and random.
+NTFY_SERVER="https://ntfy.sh"
+NTFY_TOPIC="PICK-A-LONG-RANDOM-TOPIC-NAME"
+
+# Telegram (optional)
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# Generic webhook (optional): JSON POST {title, body, priority}
+WEBHOOK_URL=""
+
+# --- Behavior -------------------------------------------------------------
+REALERT_HOURS=6          # re-send an unresolved alert this often
+HEARTBEAT_ENABLED=1      # one quiet daily "all is well"
+HEARTBEAT_HOUR=9         # earliest local hour for the daily heartbeat
+MIN_FREE_DISK_GB=15

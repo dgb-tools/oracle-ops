@@ -94,20 +94,59 @@ function Get-DgbJson ([string[]]$Net, [string[]]$CmdArgs) {
   catch { Log "CLIJSON-ERR net=[$($Net -join ',')] cmd=[$($CmdArgs -join ',')]: $($_.Exception.Message)"; $null }
 }
 
+# Known crash classes, matched on the last 400 lines of debug.log so a dead
+# daemon's alert says WHAT killed it, not just that it's down. Same table as
+# start-node.ps1 (each script stays standalone on purpose).
+$CrashSignatures = @(
+  @{ Pattern = 'length_error|vector::reserve'; Label = 'oversized-message crash (class seen network-wide in the Aug 2026 incident) - restart is safe; make sure you are on the latest release' },
+  @{ Pattern = 'bad_alloc';                    Label = 'out-of-memory - check RAM/dbcache before it repeats' },
+  @{ Pattern = 'Assertion failed';             Label = 'assertion failure - capture debug.log before it rotates and report to DigiByte Core' },
+  @{ Pattern = 'Corrupted block database';     Label = 'block database corruption - the node will likely need -reindex; see runbook' },
+  @{ Pattern = 'Disk space is too low';        Label = 'disk full' }
+)
+function Get-CrashClass([string]$ChainLabel) {
+  $logFile = Join-Path $DataDir 'debug.log'
+  if ($ChainLabel -eq 'testnet') { $logFile = Join-Path $DataDir 'testnet26\debug.log' }
+  if (-not (Test-Path $logFile)) { return 'no debug.log found' }
+  try {
+    $tail = (Get-Content $logFile -Tail 400) -join "`n"
+    foreach ($sig in $CrashSignatures) { if ($tail -match $sig.Pattern) { return $sig.Label } }
+    return 'no known crash signature in recent log (clean stop, kill, or a new class)'
+  } catch { return "could not read debug.log: $($_.Exception.Message)" }
+}
+
 # ---------- per-chain checks ----------
 function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool]$IsMainnet) {
   $summary = @()
 
-  $proc = Get-CimInstance Win32_Process -Filter "Name = 'digibyted.exe'" |
-          Where-Object { $_.CommandLine -match $ProcPattern }
-  Report-Check "$Label-daemon" ([bool]$proc) "DGB oracle box: $Label daemon DOWN" `
-    "digibyted ($Label) is not running. If a scheduled task should restart it and this repeats, log in and investigate." 'urgent'
-  if (-not $proc) { return ,@("${Label}: DAEMON DOWN") }
-
+  # Liveness is judged by the RPC first, not by process-cmdline sniffing: a
+  # mainnet daemon started with plain flags (just -datadir) carries nothing to
+  # pattern-match and would false-alarm as DOWN. RPC answering = chain is up.
+  # (Found live: the first kit test false-alarmed on exactly such a node.)
   $bc = Get-DgbJson $Net @('getblockchaininfo')
-  Report-Check "$Label-rpc" ([bool]$bc) "DGB oracle box: $Label RPC unreachable" `
-    "Daemon process exists but RPC is not answering (may be starting up / verifying blocks)." 'high'
-  if (-not $bc) { return ,@("${Label}: RPC not answering") }
+  if (-not $bc) {
+    $proc = Get-CimInstance Win32_Process -Filter "Name = 'digibyted.exe'"
+    if ($proc) {
+      Report-Check "$Label-daemon" $true "DGB oracle box: $Label daemon DOWN" '' 'urgent'
+      Report-Check "$Label-rpc" $false "DGB oracle box: $Label RPC unreachable" `
+        "A digibyted process exists but $Label RPC is not answering (starting up, verifying blocks, or running with different chain flags)." 'high'
+      return ,@("${Label}: RPC not answering")
+    }
+    $body = "digibyted ($Label) is not running.`nCrash-class read: $(Get-CrashClass $Label)"
+    if ($Cfg.PSObject.Properties['auto_restart'] -and $Cfg.auto_restart -and (Test-Path "$Base\start-node.ps1")) {
+      $body += "`nAuto-restart: attempting now (the 'DigiByteOracleNode' task also covers this within 5 minutes)."
+      try {
+        Start-Process powershell -WindowStyle Hidden -ArgumentList `
+          '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', "`"$Base\start-node.ps1`"", '-Chain', $Label
+      } catch { Log "AUTORESTART-SPAWN-FAIL ${Label}: $($_.Exception.Message)" }
+    } else {
+      $body += "`nAuto-restart is off. Install it (install-node-task.ps1) or log in and start the daemon."
+    }
+    Report-Check "$Label-daemon" $false "DGB oracle box: $Label daemon DOWN" $body 'urgent'
+    return ,@("${Label}: DAEMON DOWN")
+  }
+  Report-Check "$Label-daemon" $true "DGB oracle box: $Label daemon DOWN" '' 'urgent'
+  Report-Check "$Label-rpc" $true "DGB oracle box: $Label RPC unreachable" '' 'high'
 
   $lag = [int64]$bc.headers - [int64]$bc.blocks
   $tipTime = 0; if ($bc.PSObject.Properties['time']) { $tipTime = [int64]$bc.time } else { $tipTime = [int64]$bc.mediantime }

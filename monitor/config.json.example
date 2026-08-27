@@ -2,9 +2,11 @@
   "oracle_id": 0,
   "oracle_wallet": "oracle",
   "cli_exe": "C:\\Program Files\\DigiByte\\daemon\\digibyte-cli.exe",
+  "daemon_exe": "C:\\Program Files\\DigiByte\\daemon\\digibyted.exe",
   "datadir": "C:\\Users\\YOURUSER\\AppData\\Roaming\\DigiByte",
   "monitor_testnet": true,
   "monitor_mainnet": true,
+  "auto_restart": true,
 
   "ntfy_server": "https://ntfy.sh",
   "ntfy_topic": "PICK-A-LONG-RANDOM-TOPIC-NAME",

@@ -1,0 +1,43 @@
+# digibyted.service — keeps your DigiByte node running WITHOUT a human.
+#
+# Restart=always is the whole point: in the August 2026 incident a single
+# malformed network message crashed daemons network-wide, and most oracle
+# slots stayed dark for up to a day because nothing restarted them. With this
+# unit, systemd brings the node back in 15 seconds and the monitor tells you
+# what happened.
+#
+# Edit User/paths for your box, then:  sudo cp digibyted.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now digibyted
+#
+# NOTE for encrypted oracle wallets: the NODE returns automatically, but your
+# ORACLE stays stopped until you unlock the wallet (walletpassphrase, then
+# startoracle). The monitor pages you for exactly that state. Unencrypted
+# oracle wallets resume on their own (Core auto-starts oracles on wallet load).
+
+[Unit]
+Description=DigiByte daemon (DigiDollar oracle node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=digibyte
+Group=digibyte
+ExecStart=/usr/local/bin/digibyted -datadir=/home/digibyte/.digibyte -printtoconsole
+# Clean shutdown can take minutes on a busy node; don't let systemd SIGKILL a
+# flushing database.
+TimeoutStopSec=600
+KillMode=process
+Restart=always
+RestartSec=15
+# If it crash-loops hard (5 restarts in 10 min), stop and leave the evidence.
+# The monitor alerts on "daemon DOWN" with the crash class at that point.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Basic hardening; loosen if your datadir lives somewhere exotic.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

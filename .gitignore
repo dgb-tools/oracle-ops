@@ -3,3 +3,6 @@ monitor/config.json
 *.log.old
 state.json
 .DS_Store
+linux/config
+linux/state/
+keeper.log

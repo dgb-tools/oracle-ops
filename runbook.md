@@ -115,3 +115,81 @@ Price bundles may be intermittent network-wide until more mining pools add the
 `digidollar-oracle` GBT rule. That is miner-side adoption, not an oracle fault —
 check whether *your* slot is reporting with a fresh, valid heartbeat before assuming
 you have a problem.
+
+## The August 2026 crash — what a network-wide incident looks like from inside
+
+On August 26–27, 2026, a malformed network message crashed mainnet daemons across
+the oracle network. Reporting oracles fell from ~31 of 35 to **11** (quorum is 7)
+within hours, and recovery took about a day — driven almost entirely by operators
+noticing by hand. Our slot was among the crashed and came back quickly for one
+boring reason: a scheduled task restarted the daemon, and the monitor paged us.
+Everything in this section is what that day taught.
+
+### Make the restart automatic — the two Windows task traps
+
+A startup-only scheduled task starts your daemon **once per boot**. The first
+crash after that leaves the box dark until a human logs in — which is exactly how
+most slots spent the incident. Two settings fix it, and both are non-defaults:
+
+1. **Add a repetition trigger** (every 5 minutes) that runs a starter script which
+   exits silently when the daemon is already up. Boot trigger alone is not a
+   restart policy.
+2. **Set the task's execution time limit to 0.** The Windows default (PT72H)
+   silently kills any task after 72 hours — for a task that IS your daemon, that
+   is a scheduled outage three days after every boot.
+
+The kit's `monitor/install-node-task.ps1` registers a task with both settings;
+`linux/systemd/digibyted.service` is the same protection via `Restart=always`.
+
+### Post-crash triage: one incident, not two
+
+After an unclean daemon death, **`getdigidollarstats` can stay unavailable for
+HOURS while `getoracles` and `getoracleprice` work perfectly.** The DigiDollar
+stats index rebuilds from genesis after a crash (~100K blocks/min on our box);
+the oracle-price index is separate and comes back immediately. So a node whose
+oracle is signing fine but whose stats RPC errors is EXPECTED after a crash — it
+is the tail of the same incident, not a second one. It self-heals; don't restart
+the node again (that starts the rebuild over).
+
+### Read the crash class before you shrug
+
+The monitor and keeper now annotate every daemon-down alert with a crash-class
+read from the last 400 log lines. What the classes mean:
+
+| Signature in the log | What it means | What to do |
+|---|---|---|
+| `length_error` / `vector::reserve` | the oversized-message class from this incident | restart is safe; be on the latest release |
+| `bad_alloc` | out of memory | check RAM vs `dbcache` before it repeats |
+| `Assertion failed` | consensus-adjacent bug | save the log, report to Core |
+| `Corrupted block database` | unclean-death damage | expect `-reindex`; see reboot section |
+| `Disk space is too low` | disk full | free space; the monitor's disk check warns earlier |
+
+A crash with **no** known signature is worth keeping the log for — new classes
+are how the next incident gets named.
+
+### Are your price sources reachable?
+
+Every oracle fetches the same six public exchange APIs and needs **3 of 6** to
+publish. If your slot stops publishing with the daemon healthy, check outbound
+reachability before suspecting the oracle (`Insufficient price sources` in the
+log is the giveaway — see the operator guide's exchange-feed section). A quick
+probe from the box:
+
+```
+curl -sfm 10 -o /dev/null -w "coingecko %{http_code}\n" "https://api.coingecko.com/api/v3/ping"
+curl -sfm 10 -o /dev/null -w "binance   %{http_code}\n" "https://api.binance.com/api/v3/ping"
+curl -sfm 10 -o /dev/null -w "kucoin    %{http_code}\n" "https://api.kucoin.com/api/v1/timestamp"
+```
+
+Any two of those failing from a box that can otherwise reach the internet means
+your slot's problem is network egress (DNS, TLS CA bundle, geoblocking), not
+DigiByte.
+
+### Version lag is the exploit window
+
+During the incident, seven slots were running releases one or two versions old.
+When a crash-fix release ships, the gap between "release published" and "your
+slot upgraded" is the window in which the same bug can take you down again. The
+monitor's version-drift check exists for exactly this; the runbook's upgrade
+template above makes the fix a 25-minute job. Treat a version-drift alert as
+maintenance scheduling, not information.

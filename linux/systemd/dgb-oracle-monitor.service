@@ -1,0 +1,13 @@
+# One monitor run. Fired every 5 minutes by dgb-oracle-monitor.timer.
+# Edit the path and user, then install both files:
+#   sudo cp dgb-oracle-monitor.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dgb-oracle-monitor.timer
+
+[Unit]
+Description=DigiByte oracle monitor (single run)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=digibyte
+ExecStart=/opt/oracle-ops/linux/dgb-oracle-monitor.sh
