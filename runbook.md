@@ -193,3 +193,12 @@ slot upgraded" is the window in which the same bug can take you down again. The
 monitor's version-drift check exists for exactly this; the runbook's upgrade
 template above makes the fix a 25-minute job. Treat a version-drift alert as
 maintenance scheduling, not information.
+
+### Crash classes added 2026-09-09 (anchor node, v9.26.5 Windows)
+
+| class | what you see | what it is not | remedy |
+|---|---|---|---|
+| `rpc-accept-dead` | process alive; `UpdateTip` still advancing in `debug.log`; RPC port `LISTENING` with nothing connected; every `digibyte-cli` call fails with *"Could not connect … timeout reached"* for minutes | not a crash (no signal, no exit), not a hang (blocks keep flowing), not a stuck client (kill the clients, it persists) | `monitor/anchor-keeper.ps1`: 5 consecutive failed probes on the same PID → kill that PID → wait for the port to free → boot task once → verify new PID answers RPC → once more if not → alert. Budget 3/day. |
+| `process-hung` | process alive, height not advancing, log stalls | not `rpc-accept-dead` — the keeper records it and pages, it does not auto-restart | investigate; hard-kill by hand if confirmed |
+
+Seen twice in 48 hours on the same anchor. A boot-trigger-only task reports "currently running" after the daemon is killed; the first `schtasks /Run` clears that stale instance and starts nothing — the keeper accounts for that. Log rotation is a false "stall"; a node in IBD answers RPC with `-28`, which the keeper treats as healthy for this class.
