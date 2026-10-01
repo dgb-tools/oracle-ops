@@ -89,17 +89,29 @@ installer runs — this supersedes reboot-and-revalidate as the maintenance path
 #    (v9.26.5 Windows asset, self-recorded because that release published none:
 #    SHA256 880CDD2CC3CABCC838AEA6045647D7FD4AC4CA95BE25FD808C939641386B9325)
 
-# 2. Stop BOTH chains cleanly:
+# 2. PAUSE AUTO-RESTART FIRST. If you installed this kit's keeper task (5-minute repetition)
+#    or a systemd unit with Restart=, it will relaunch the daemon minutes after your clean
+#    stop and race the installer. Observed on slot 29 during the v9.26.6 upgrade
+#    (2026-10-01): both daemons came back mid-window, and the mainnet one was in warmup,
+#    where RPC refuses `stop`.
+#      Windows:  Disable-ScheduledTask -TaskName DigiByteOracleNode     (your task name)
+#      Linux:    sudo systemctl stop digibyted     (stop through systemd, not the CLI, so
+#                the unit does not restart it; this is the clean stop for step 3)
+
+# 3. Stop BOTH chains cleanly (Windows, or any setup not managed by systemd):
 digibyte-cli -testnet=0 -chain=main stop
 digibyte-cli -testnet stop
 
-# 3. WAIT for the clean flush — 2–4 minutes with a big dbcache. The log line you
-#    want is "Shutdown: done". Never kill the process: that converts your clean
-#    upgrade into the hard-reboot scenario at the top of this runbook.
+# 4. WAIT for the clean flush. 2–4 minutes with a big dbcache in July; about 7 minutes
+#    after 35 days of uptime in October. Budget 10. The log line you want is
+#    "Shutdown: done". Never kill the process: that converts your clean upgrade into
+#    the hard-reboot scenario at the top of this runbook.
 
-# 4. Run the installer over the old binaries; restart your tasks/daemons.
+# 5. Run the installer over the old binaries. Then re-enable what you paused and start it:
+#      Windows:  Enable-ScheduledTask -TaskName DigiByteOracleNode; Start-ScheduledTask -TaskName DigiByteOracleNode
+#      Linux:    sudo systemctl start digibyted
 
-# 5. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above).
+# 6. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above).
 ```
 
 Because the clean stop flushes the chainstate, the mainnet tip never drops below
