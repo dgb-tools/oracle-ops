@@ -157,7 +157,8 @@ the node again (that starts the rebuild over).
 
 ### Read the crash class before you shrug
 
-The monitor and keeper now annotate every daemon-down alert with a crash-class
+The monitor and the node keeper (`start-node.ps1`, the auto-restart task; not the withdrawn
+`anchor-keeper.ps1`) annotate every daemon-down alert with a crash-class
 read from the last 400 log lines. What the classes mean:
 
 | Signature in the log | What it means | What to do |
@@ -218,7 +219,7 @@ cause unconfirmed.** Three levels of evidence, kept separate:
   (`GetFirstStoredBlock`), potentially millions of entries on this node. The daemon had 7.0 GB
   of private memory against a 2.2 GB working set, which is consistent with substantial paging;
   index residency was not measured, and no thread stacks were captured during a stall. The
-  walk under `cs_main`, aggravated by paging, is the leading explanation. v9.26.6 does not
+  walk under `cs_main`, potentially aggravated by paging, is the leading explanation. v9.26.6 does not
   change that code path.
 
 What follows from the observation alone:
@@ -227,8 +228,9 @@ What follows from the observation alone:
   recovered every time without a restart.
 - Separate two questions. *Is the process and its network side responsive?* and *is the tip
   advancing?* `getblockcount` also takes `cs_main` and will time out during such a stall;
-  `getnetworkinfo` answering does not show chain progress. Tip advancement is read from
-  `UpdateTip` in `debug.log` or from a second source such as an explorer.
+  `getnetworkinfo` answering does not show chain progress. Read local tip advancement from
+  this node's `UpdateTip` log; use an independent explorer to measure network advancement
+  and the node's lag.
 - `getdigidollarstats` is not free either: it paused block processing for about a minute in
   the same timeline. Do not schedule heavy RPC calls against a small prune-mode node.
 - A client timeout does not cancel the call on the server. Repeated probes can pile up behind
