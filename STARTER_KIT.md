@@ -58,7 +58,7 @@ manual unlock — that's by design, not a bug.
   died)
 - A green RECOVERED notice when it clears; a quiet daily heartbeat so silence
   never means "the monitor died"
-- A version-drift warning when a new Core release ships — during the August
+- A version-drift warning within the hour when a new Core release ships — during the August
   incident, seven slots were running old releases; when the fix ships, the
   un-upgraded window is where the same crash can repeat
 

@@ -230,9 +230,12 @@ try {
   Report-Check 'disk' ($free -gt ($minGb * 1GB)) 'DGB oracle box: LOW DISK' `
     ("C: has {0:N1} GB free (threshold {1} GB)." -f ($free / 1GB), $minGb) 'high'
 
-  # Version drift vs GitHub (checked every 12h)
+  # Version drift vs GitHub (checked hourly). /releases/latest excludes prereleases, so release
+  # candidates never page. Hourly because a mandatory release can ship with a deadline: with the
+  # old 12-hour cadence v9.26.6 (2026-10-01) would have gone unreported for up to 12 hours.
+  # One unauthenticated GitHub API call per hour is far inside the 60/hour limit.
   $lastVc = 0; if ($State.ContainsKey('ver-check-ts')) { $lastVc = [int64]$State['ver-check-ts'] }
-  if (($Now - $lastVc) -gt 43200) {
+  if (($Now - $lastVc) -gt 3600) {
     $State['ver-check-ts'] = $Now
     try {
       $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/DigiByte-Core/digibyte/releases/latest' `
@@ -244,7 +247,7 @@ try {
       if ($ni -and $ni.subversion -match '(\d+\.\d+\.\d+)') { $local = [version]$Matches[1] }
       if ($latest -and $local) {
         Report-Check 'version' ($local -ge $latest) 'DGB oracle box: version drift' `
-          "Local $local < latest release $latest ($($rel.tag_name)). Plan an upgrade." 'default'
+          "Local $local < latest release $latest ($($rel.tag_name)). Read the release notes for an upgrade deadline, then plan the upgrade (runbook: clean-stop procedure)." 'default'
       }
     } catch { Log "ver-check failed: $($_.Exception.Message)" }
   }

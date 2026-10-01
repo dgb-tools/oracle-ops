@@ -82,7 +82,11 @@ installer runs — this supersedes reboot-and-revalidate as the maintenance path
 
 ```
 # 1. Download the new installer and verify its hash BEFORE touching the node.
-#    (v9.26.5 Windows asset, self-recorded — the release published no checksums:
+#    v9.26.6 (MANDATORY before mainnet block 24,490,000, ~1 Nov 2026) is the first release
+#    with published checksums; GitHub's asset digests match the release notes:
+#      714dfdb2a2dfcf1893b66c541386b173b1959153675699bab30eac96e0135db5  digibyte-9.26.6-win64-setup.exe
+#      cdbd6ed7efdb006b91b76389db79d2a3db2593f05e56dd789f394a1b4366c211  digibyte-9.26.6-x86_64-linux-gnu.tar.gz
+#    (v9.26.5 Windows asset, self-recorded because that release published none:
 #    SHA256 880CDD2CC3CABCC838AEA6045647D7FD4AC4CA95BE25FD808C939641386B9325)
 
 # 2. Stop BOTH chains cleanly:
@@ -194,11 +198,52 @@ monitor's version-drift check exists for exactly this; the runbook's upgrade
 template above makes the fix a 25-minute job. Treat a version-drift alert as
 maintenance scheduling, not information.
 
-### Crash classes added 2026-09-09 (anchor node, v9.26.5 Windows)
+### Correction, 2026-10-01: "rpc-accept-dead" was a misdiagnosis
 
-| class | what you see | what it is not | remedy |
-|---|---|---|---|
-| `rpc-accept-dead` | process alive; `UpdateTip` still advancing in `debug.log`; RPC port `LISTENING` with nothing connected; every `digibyte-cli` call fails with *"Could not connect … timeout reached"* for minutes | not a crash (no signal, no exit), not a hang (blocks keep flowing), not a stuck client (kill the clients, it persists) | `monitor/anchor-keeper.ps1`: 5 consecutive failed probes on the same PID → kill that PID → wait for the port to free → boot task once → verify new PID answers RPC → once more if not → alert. Budget 3/day. |
-| `process-hung` | process alive, height not advancing, log stalls | not `rpc-accept-dead` — the keeper records it and pages, it does not auto-restart | investigate; hard-kill by hand if confirmed |
+On 2026-09-09 this runbook described a crash class `rpc-accept-dead` on our prune-mode anchor
+node and said a keeper had been dry-run verified against it. **Both statements were incorrect,
+and the error was ours.** The condition is now named **RPC timeout with chain-progress stall;
+cause unconfirmed.** Three levels of evidence, kept separate:
 
-Seen three times in 48 hours on the same anchor, and **intermittent**: the RPC came back on its own after stretches of roughly 10–100 minutes (14:00→15:43Z on 09-08; ~23:00→23:31Z on 09-09) with the same PID throughout. So: the keeper's 5-consecutive-minute rule restarts only inside a stretch; a scheduled RPC client (the calendar batcher) must retry across its window rather than fail on the first dead minute; and a dry-run of the keeper against the live class classified it correctly on 09-09 (`rpc-accept-dead`, height advancing 24183614→24183615) while the real kill path has not yet fired — the RPC recovered before the live run's first probe. A boot-trigger-only task reports "currently running" after the daemon is killed; the first `schtasks /Run` clears that stale instance and starts nothing — the keeper accounts for that. Log rotation is a false "stall"; a node in IBD answers RPC with `-28`, which the keeper treats as healthy for this class.
+- **Observed (2026-10-01, v9.26.5, Windows, 8 GB RAM, `prune=10000`).** Block processing and
+  RPC stopped together for 14 minutes 37 seconds (last `UpdateTip` 22:30:05Z, next 22:44:42Z),
+  then the node resumed and caught up 60 blocks within seconds, under the same process, with
+  no restart. Earlier instances lasted about 30 and 103 minutes and also ended by themselves.
+- **Strongly implicated trigger.** All four recorded stalls followed our own
+  `getblockchaininfo` request on that node. On 2026-10-01, `getblockcount` and
+  `getdigidollarstats` had answered seconds earlier.
+- **Inferred mechanism, not directly measured.** `getblockchaininfo` holds the main chain lock
+  (`cs_main`) for its whole body. On a prune-mode node it computes `pruneheight` by walking the
+  block index backward from the tip to the first block whose data is gone
+  (`GetFirstStoredBlock`), potentially millions of entries on this node. The daemon had 7.0 GB
+  of private memory against a 2.2 GB working set, which is consistent with substantial paging;
+  index residency was not measured, and no thread stacks were captured during a stall. The
+  walk under `cs_main`, aggravated by paging, is the leading explanation. v9.26.6 does not
+  change that code path.
+
+What follows from the observation alone:
+
+- A probe timeout means **unknown**, not dead, and is not permission to kill. This node
+  recovered every time without a restart.
+- Separate two questions. *Is the process and its network side responsive?* and *is the tip
+  advancing?* `getblockcount` also takes `cs_main` and will time out during such a stall;
+  `getnetworkinfo` answering does not show chain progress. Tip advancement is read from
+  `UpdateTip` in `debug.log` or from a second source such as an explorer.
+- `getdigidollarstats` is not free either: it paused block processing for about a minute in
+  the same timeline. Do not schedule heavy RPC calls against a small prune-mode node.
+- A client timeout does not cancel the call on the server. Repeated probes can pile up behind
+  the one already running.
+- The oracle box (unpruned) showed a related effect in August: `getblockchaininfo` went
+  unanswered for about eight minutes while a stats-index rebuild held the same lock.
+
+**Known issue in this kit's own monitor.** `oracle-monitor.ps1` and `dgb-oracle-monitor.sh` call
+`getblockchaininfo` on every run to read blocks, headers, tip time and the initial-sync flag. On
+an unpruned node with enough memory that has been cheap, and it is how slot 29 has run since
+July. On a small prune-mode node it could repeatedly trigger the stall above or accumulate
+waiting requests. Until the monitor's liveness check is changed, do not point it at a
+prune-mode node on a small box.
+
+**`monitor/anchor-keeper.ps1` is withdrawn.** It would have mistaken this recoverable stall for
+a condition requiring termination. It was never installed. A bounded escalation path remains
+the goal: alert on a stall that outlasts a stated limit and leave the decision to restart to
+the operator, with thread stacks and CPU and disk figures captured first.

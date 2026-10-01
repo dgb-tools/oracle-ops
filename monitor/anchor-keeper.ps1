@@ -1,3 +1,6 @@
+# WITHDRAWN 2026-10-01 — DO NOT INSTALL. The class this script targets was misdiagnosed: the RPC
+# stalls were caused by our own getblockchaininfo calls on a prune-mode node (see runbook.md,
+# "Correction, 2026-10-01"). The node was busy, not dead. Kept for history until redesigned.
 # Anchor-node keeper for the "rpc-accept-dead" class. Runs from a scheduled task every 5 min.
 # Class (observed 2026-09-08/09, DigiByte Core v9.26.5, Windows): the digibyted process is
 # alive and still processing blocks, the RPC port is bound (LISTENING), nothing is connected,

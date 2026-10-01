@@ -164,9 +164,13 @@ resume with an encrypted wallet), the recovery procedure, how to avoid all of it
 with a clean stop — and the proven two-chain **upgrade template** (v9.26.4 →
 v9.26.5 in ~25 minutes, no rollback). Learned on a live slot so you don't have to.
 
-**If you haven't upgraded yet:** v9.26.5's versionbits cache cuts the mainnet
-oracle startup scan from ~15 minutes to seconds, so every future restart gets
-cheaper. Drop-in binaries, no consensus change.
+**Upgrade deadline: v9.26.6 is mandatory before mainnet block 24,490,000 (around
+1 November 2026).** Released 2026-10-01, it changes consensus at that height ("Thaw
+Day", new DigiDollar block rules) and applies to every full node and miner, not only
+oracles; a node left on older software can end up on a different chain. It is also
+the first release to publish checksums — verify yours before installing (hashes in
+the [runbook](runbook.md), upgrade section). The clean-stop
+procedure below is the same one proven on v9.26.4 → v9.26.5.
 
 ## Related
 

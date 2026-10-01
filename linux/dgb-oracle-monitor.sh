@@ -262,9 +262,11 @@ if [ -n "$free_gb" ]; then
     "Datadir volume has ${free_gb} GB free (threshold $MIN_FREE_DISK_GB GB)." high
 fi
 
-# Version drift vs GitHub (checked every 12h)
+# Version drift vs GitHub (checked hourly). /releases/latest excludes prereleases, so release
+# candidates never page. Hourly because a mandatory release can ship with a deadline; one
+# unauthenticated GitHub API call per hour is far inside the 60/hour limit.
 lastvc=$(state_get ver-check-ts 0)
-if [ $((NOW - lastvc)) -gt 43200 ]; then
+if [ $((NOW - lastvc)) -gt 3600 ]; then
   state_set ver-check-ts "$NOW"
   latest=$(curl -fsS -m 20 -H 'User-Agent: dgb-oracle-monitor' \
     https://api.github.com/repos/DigiByte-Core/digibyte/releases/latest 2>/dev/null | jq -r .tag_name | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
@@ -274,7 +276,7 @@ if [ $((NOW - lastvc)) -gt 43200 ]; then
     ok=0
     [ "$(printf '%s\n%s\n' "$latest" "$local_ver" | sort -V | tail -1)" = "$local_ver" ] && ok=1
     report_check version "$ok" "DGB oracle box: version drift" \
-      "Local $local_ver < latest release $latest. Plan an upgrade (see runbook for the proven two-chain procedure)." default
+      "Local $local_ver < latest release $latest. Read the release notes for an upgrade deadline, then plan the upgrade (see runbook for the proven two-chain procedure)." default
   fi
 fi
 
