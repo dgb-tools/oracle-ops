@@ -90,26 +90,37 @@ installer runs — this supersedes reboot-and-revalidate as the maintenance path
 #    SHA256 880CDD2CC3CABCC838AEA6045647D7FD4AC4CA95BE25FD808C939641386B9325)
 
 # 2. PAUSE AUTO-RESTART FIRST. If you installed this kit's keeper task (5-minute repetition)
-#    or a systemd unit with Restart=, it will relaunch the daemon minutes after your clean
+#    or the systemd unit (Restart=always), it will relaunch the daemon minutes after a CLI
 #    stop and race the installer. Observed on slot 29 during the v9.26.6 upgrade
 #    (2026-10-01): both daemons came back mid-window, and the mainnet one was in warmup,
 #    where RPC refuses `stop`.
 #      Windows:  Disable-ScheduledTask -TaskName DigiByteOracleNode     (your task name)
-#      Linux:    sudo systemctl stop digibyted     (stop through systemd, not the CLI, so
-#                the unit does not restart it; this is the clean stop for step 3)
+#                Disabling prevents future launches; it does not cancel a starter that is
+#                already running.
+#      Linux:    sudo systemctl stop digibyted     (one command per chain if you run a unit
+#                per chain). An explicit systemd stop sends SIGTERM, which is a clean
+#                shutdown, and suppresses the restart. This IS the clean stop: skip step 3.
 
-# 3. Stop BOTH chains cleanly (Windows, or any setup not managed by systemd):
+# 3. Windows, or any setup not managed by systemd: stop BOTH chains cleanly.
 digibyte-cli -testnet=0 -chain=main stop
 digibyte-cli -testnet stop
+#    If RPC refuses `stop` because the daemon is still warming up, wait for warmup to
+#    finish and ask again. Do not kill it.
 
-# 4. WAIT for the clean flush. 2–4 minutes with a big dbcache in July; about 7 minutes
-#    after 35 days of uptime in October. Budget 10. The log line you want is
-#    "Shutdown: done". Never kill the process: that converts your clean upgrade into
-#    the hard-reboot scenario at the top of this runbook.
+# 4. WAIT for the clean flush, and confirm it. Observed shutdowns on our box: 2-4 minutes
+#    in July; about 7 minutes during October's upgrade after 35 days of uptime. These are
+#    observations, not guarantees. Budget 10. Confirm "Shutdown: done" in the log AND that
+#    the process has exited, for both chains, before installing. Never kill the process:
+#    that converts your clean upgrade into the hard-reboot scenario at the top of this
+#    runbook. Note the shipped systemd unit sets TimeoutStopSec=600: systemd itself will
+#    force-kill a shutdown that runs past 600 seconds, so a flush longer than that needs
+#    the timeout raised first.
 
-# 5. Run the installer over the old binaries. Then re-enable what you paused and start it:
-#      Windows:  Enable-ScheduledTask -TaskName DigiByteOracleNode; Start-ScheduledTask -TaskName DigiByteOracleNode
+# 5. Run the installer over the old binaries. Then resume:
 #      Linux:    sudo systemctl start digibyted
+#      Windows:  Enable-ScheduledTask -TaskName DigiByteOracleNode, then start it once
+#                (Start-ScheduledTask -TaskName DigiByteOracleNode). The 5-minute trigger
+#                is a re-check, not a start.
 
 # 6. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above).
 ```
