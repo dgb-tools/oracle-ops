@@ -262,7 +262,9 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
     if [ "$ismainnet" = "1" ]; then
       local nraw nme nvalid nhb nlu readok=0
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
-      # schema: array of objects with integer oracle_id, string status, string heartbeat_status, last_update number or null; 35 unique ids
+      # schema: array of objects with integer oracle_id, string status, string heartbeat_status, last_update number or null.
+      # The 35-unique-ids requirement is a deliberate compatibility restriction to the current mainnet roster size
+      # (consensus.nOracleTotalOracles = 35); it is not proof that the response is complete or correct.
       nvalid=$(jq -r 'if type=="array" and length>0 and all(.[]; type=="object" and (.oracle_id|type=="number") and (.status|type=="string") and (.heartbeat_status|type=="string") and ((.last_update|type)=="number" or (.last_update|type)=="null")) and ([.[].oracle_id]|unique|length)==35 then "ok" else "bad" end' <<< "$nraw" 2>/dev/null || echo bad)
       nme=""; [ "$nvalid" = "ok" ] && nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
       if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme"); else nhb=""; nlu=""; fi
@@ -300,7 +302,7 @@ if [ "${1:-}" = "--netview-selftest" ]; then
     local name="$1"; shift; local ok=1 trace="" alert=0; rm -f "$STATE"/net-*; total=$((total + 1))
     for step in "$@"; do
       IFS=: read -r ro hb age off expf expa <<< "$step"; local lu=""
-      case "$age" in none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
+      case "$age" in none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; soon) lu=$((t0 + off + 120)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
       netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600
       # caller wiring under test: alert set only on fire; cleared only on hit; otherwise untouched
       if [ "$NV_FIRE" = "1" ]; then alert=1; elif [ "$NV_OUTCOME" = "hit" ]; then alert=0; fi
@@ -319,6 +321,7 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case "active alert survives unknown reads (unconfirmed, not recovered)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 0::0:1200:0:1 0::0:1500:0:1
   run_case "active alert survives a stale heartbeat (restart does not count as recovery)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:stale:5200:1200:0:1 1:stale:5500:1500:0:1
   run_case "malformed and future timestamps are unknown: never fire, never clear" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:bad:1200:0:1 1:fresh:future:1500:0:1
+  run_case "last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:soon:1200:0:0
   run_case "confirmed recovery clears the alert" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:60:1200:0:0
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi

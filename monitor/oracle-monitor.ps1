@@ -263,6 +263,8 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
           if (-not ($e.PSObject.Properties['oracle_id'] -and $e.PSObject.Properties['status'] -and $e.PSObject.Properties['heartbeat_status'])) { throw "roster entry missing oracle_id/status/heartbeat_status" }
         }
         $ids = @($netRoster | ForEach-Object { [int]$_.oracle_id } | Sort-Object -Unique)
+        # 35 unique ids is a deliberate compatibility restriction to the current mainnet roster size
+        # (consensus.nOracleTotalOracles = 35), not proof that the response is complete or correct.
         if ($ids.Count -ne 35) { throw "roster completeness unconfirmed: $($ids.Count) unique ids" }
         $nme = $netRoster | Where-Object { [int]$_.oracle_id -eq $OracleId } | Select-Object -First 1
         if (-not $nme) { throw "slot $OracleId absent; configuration or response completeness unconfirmed" }
@@ -307,6 +309,7 @@ if ($NetViewSelfTest) {
     @{ name = 'active alert survives unknown reads (unconfirmed, not recovered)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($false,'',0,1200,$false,1), @($false,'',0,1500,$false,1)) },
     @{ name = 'active alert survives a stale heartbeat (restart does not count as recovery)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'stale',5200,1200,$false,1), @($true,'stale',5500,1500,$false,1)) },
     @{ name = 'malformed and future timestamps are unknown: never fire, never clear'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh','bad',1200,$false,1), @($true,'fresh','future',1500,$false,1)) },
+    @{ name = 'last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh','soon',1200,$false,0)) },
     @{ name = 'confirmed recovery clears the alert'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh',60,1200,$false,0)) }
   )
   $fails = 0; $t0 = 1800000000
@@ -316,7 +319,7 @@ if ($NetViewSelfTest) {
       $entry = $null
       if ($s[0]) {
         $lu = $null
-        switch ("$($s[2])") { 'none' { $lu = $null } 'future' { $lu = $t0 + $s[3] + 3600 } 'bad' { $lu = '12abc' } default { $lu = $t0 + $s[3] - [int]$s[2] } }
+        switch ("$($s[2])") { 'none' { $lu = $null } 'future' { $lu = $t0 + $s[3] + 3600 } 'soon' { $lu = $t0 + $s[3] + 120 } 'bad' { $lu = '12abc' } default { $lu = $t0 + $s[3] - [int]$s[2] } }
         $entry = [pscustomobject]@{ heartbeat_status = $s[1]; last_update = $lu }
       }
       $r = Update-NetViewState $st ([bool]$s[0]) $entry ([int64]($t0 + $s[3])) 3600
