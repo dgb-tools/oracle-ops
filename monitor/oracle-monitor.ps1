@@ -3,7 +3,8 @@
 # Read-only: RPC status calls only; never touches keys, wallets, or passphrases.
 # Alerts via ntfy (default) / Telegram / webhook — see config.json.
 # Windows PowerShell 5.1+. Runs every 5 min via a scheduled task (see install.ps1).
-param([switch]$TestAlert)
+param(
+  [switch]$NetViewSelfTest,[switch]$TestAlert)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -11,7 +12,9 @@ $ErrorActionPreference = 'Stop'
 $Base      = $PSScriptRoot
 $LogPath   = "$Base\monitor.log"
 $StatePath = "$Base\state.json"
-$Cfg       = Get-Content "$Base\config.json" -Raw | ConvertFrom-Json
+$Cfg       = $null
+if ($NetViewSelfTest) { $Cfg = [pscustomobject]@{ oracle_id = 29; cli_exe = ""; datadir = ""; oracle_wallet = "oracle" } }
+else { $Cfg = Get-Content "$Base\config.json" -Raw | ConvertFrom-Json }
 
 $CliExe   = $Cfg.cli_exe
 $DataDir  = $Cfg.datadir
@@ -122,6 +125,26 @@ function Get-CrashClass([string]$ChainLabel) {
 }
 
 # ---------- per-chain checks ----------
+# Network-view state machine (pure; no I/O). Rules, per crew review 2026-10-06:
+#  - a MISS is a successful read where our slot has heartbeat_status 'fresh' and last_update older than
+#    $StaleSeconds (or unset); any other successful read is a HIT and clears pending evidence;
+#  - the alert FIRES only on a successful MISS that is the third or later consecutive miss AND at least
+#    900 s after the first miss of the streak;
+#  - an UNKNOWN read (fetch failure, bad body, incomplete roster, our id absent) is never a miss, never a
+#    hit, never fires, never clears: pending evidence (streak) is reset, the alert state is left alone.
+function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU, [int]$StaleSeconds) {
+  $streak = 0; $since = $NowU
+  if ($St.ContainsKey('net-miss')) { $streak = [int]$St['net-miss'] }
+  if ($St.ContainsKey('net-miss-since')) { $since = [int64]$St['net-miss-since'] }
+  if (-not $ReadOk) { $St['net-miss'] = 0; return @{ fire = $false; miss = $false; unknown = $true; streak = 0; age = -1; minutes = 0 } }
+  $age = -1; if ($Entry.last_update) { $age = $NowU - [int64]$Entry.last_update }
+  $miss = ($Entry.heartbeat_status -eq 'fresh') -and (($age -lt 0) -or ($age -gt $StaleSeconds))
+  if ($miss) { if ($streak -eq 0) { $since = $NowU }; $streak = $streak + 1 } else { $streak = 0; $since = $NowU }
+  $St['net-miss'] = $streak; $St['net-miss-since'] = $since; $St['net-last-ok-read'] = $NowU
+  $fire = $miss -and ($streak -ge 3) -and (($NowU - $since) -ge 900)
+  return @{ fire = $fire; miss = $miss; unknown = $false; streak = $streak; age = $age; minutes = [int](($NowU - $since) / 60) }
+}
+
 function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool]$IsMainnet) {
   $summary = @()
 
@@ -214,17 +237,12 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     else     { $summary += "$Label-o$OracleId=missing" }
     # NETWORK-VIEW check (mainnet only). Never name a local '$net' in this function: PowerShell variable names
     # are case-insensitive and it would be the [string[]]$Net parameter, stringifying the roster.
-    # The node's self-view cannot see a silent price broadcast (slot 29, Oct 2026: the oracle auto-started
-    # after an upgrade, reported healthy locally, and published no price for about five days). Ask a node
-    # we do not run what it sees for our slot. Predicate, per review: the roster's `status` churns every
-    # 40-block round (reads of 13/35, 10/35 and 35/35 "reporting" within one hour are all normal), so status
-    # is NOT the signal. The signal is a fresh heartbeat with a stale `last_update` (the last price the
-    # observer received from us): healthy slots read under ~12 minutes; a silent slot reads hours or days.
-    # A miss = successful read AND heartbeat fresh AND last_update older than NetViewStaleSeconds.
-    # Alert after 3 consecutive misses spanning at least 15 minutes. A fetch failure, non-JSON body or an
-    # incomplete roster (not 35 unique ids) is "unknown": never a miss; the streak is held while the last
-    # good read is under 30 minutes old and reset after that.
+    # The node's self-view cannot see a silent price broadcast (slot 29, Oct 2026). Ask a node we do not run
+    # what it sees for our slot. The roster's `status` churns every 40-block round, so it is NOT the signal;
+    # a fresh heartbeat with a stale `last_update` is. State transitions live in Update-NetViewState (pure,
+    # self-testable with -NetViewSelfTest); this block only fetches and reports.
     if ($IsMainnet) {
+      $nowU = [int64][double]::Parse((Get-Date -UFormat %s)); $nme = $null; $readOk = $false; $why = ''
       try {
         $raw = Invoke-WebRequest -Uri $NetViewUrl -UseBasicParsing -TimeoutSec 20 `
           -Headers @{ 'User-Agent' = "dgb-oracle-monitor (slot $OracleId)"; 'Accept' = 'application/json' }
@@ -232,40 +250,51 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
         $ids = @(); if ($netRoster) { $ids = @($netRoster | ForEach-Object { $_.oracle_id } | Sort-Object -Unique) }
         if ($ids.Count -ne 35) { throw "roster incomplete or malformed: $($ids.Count) unique ids, http=$($raw.StatusCode)" }
         $nme = $netRoster | Where-Object { $_.oracle_id -eq $OracleId }
-        $nowU = [int64][double]::Parse((Get-Date -UFormat %s))
-        $luAge = -1; if ($nme -and $nme.last_update) { $luAge = $nowU - [int64]$nme.last_update }
-        $hbFresh = [bool]($nme -and ($nme.heartbeat_status -eq 'fresh'))
-        $miss = [bool]((-not $nme) -or ($hbFresh -and ($luAge -lt 0 -or $luAge -gt $NetViewStaleSeconds)))
-        $streak = 0; $since = $nowU
-        if ($State.ContainsKey('net-miss')) { $streak = [int]$State['net-miss'] }
-        if ($State.ContainsKey('net-miss-since')) { $since = [int64]$State['net-miss-since'] }
-        if ($miss) { if ($streak -eq 0) { $since = $nowU }; $streak = $streak + 1 } else { $streak = 0; $since = $nowU }
-        $State['net-miss'] = $streak; $State['net-miss-since'] = $since; $State['net-last-ok-read'] = $nowU
-        $netFail = ($streak -ge 3) -and (($nowU - $since) -ge 900)
-        $nstat = 'absent'; $nsrc = 'n/a'; $nhb = 'n/a'
-        if ($nme) { $nstat = $nme.status; $nsrc = $nme.price_source; $nhb = $nme.heartbeat_status }
+        if (-not $nme) { throw "our oracle_id $OracleId is not in a complete 35-slot roster: check oracle_id in config" }
+        $readOk = $true
+      } catch { $why = $_.Exception.Message }
+      $r = Update-NetViewState $State $readOk $nme $nowU $NetViewStaleSeconds
+      if ($readOk) {
         $localStatus = 'missing'; if ($me) { $localStatus = $me.status }
-        Report-Check "$Label-oracle$OracleId-networkview" (-not $netFail) "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" `
-          ("The observer at $NetViewUrl has not received a price from slot $OracleId for $luAge seconds " +
-           "(heartbeat $nhb, status $nstat, price_source $nsrc) across $streak consecutive reads over $([int](($nowU - $since)/60)) minutes, " +
+        Report-Check "$Label-oracle$OracleId-networkview" (-not $r.fire) "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" `
+          ("The observer at $NetViewUrl has not received a price from slot $OracleId for $($r.age) seconds " +
+           "(heartbeat $($nme.heartbeat_status), status $($nme.status), price_source $($nme.price_source)) across $($r.streak) consecutive reads over $($r.minutes) minutes, " +
            "while this node reports status=$localStatus. This is one observer's view, not network proof. Corroborate first: " +
            "read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, " +
            "the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix.") 'urgent'
-        $summary += " net-o$OracleId=$nstat/lu${luAge}s"
-      } catch {
-        # Unknown read: never a miss. The streak is HELD while the last good read is recent (so a flaky
-        # endpoint cannot erase accumulating evidence) and RESET once no good read has happened for 30
-        # minutes (so a stuck counter cannot page on stale evidence). Review ruling, 2026-10-06.
-        $nowU2 = [int64][double]::Parse((Get-Date -UFormat %s)); $lastOk = 0
-        if ($State.ContainsKey('net-last-ok-read')) { $lastOk = [int64]$State['net-last-ok-read'] }
-        if (($nowU2 - $lastOk) -gt 1800) { $State['net-miss'] = 0; Log "netview check unknown; no good read for 30 min, streak reset: $($_.Exception.Message)" }
-        else { Log "netview check unknown; streak held: $($_.Exception.Message)" }
-      }
+        $summary += " net-o$OracleId=$($nme.status)/lu$($r.age)s"
+      } else { Log "netview check unknown (pending evidence reset, alert state untouched): $why" }
     }
   } else {
     $summary += "$Label-o$OracleId=staged(pre-activation)"
   }
   ,$summary
+}
+
+
+if ($NetViewSelfTest) {
+  # Transition tests for Update-NetViewState. Each step: [readOk, hbFresh, lastUpdateAge or 'none', secondsFromStart, expectFire]
+  $cases = @(
+    @{ name = 'healthy reads never fire'; steps = @(@($true,'fresh',70,0,$false), @($true,'fresh',120,300,$false), @($true,'fresh',40,600,$false)) },
+    @{ name = 'three stale reads inside 10 min do NOT fire (elapsed gate)'; steps = @(@($true,'fresh',4000,0,$false), @($true,'fresh',4300,300,$false), @($true,'fresh',4600,600,$false)) },
+    @{ name = 'fourth stale read at 15 min fires'; steps = @(@($true,'fresh',4000,0,$false), @($true,'fresh',4300,300,$false), @($true,'fresh',4600,600,$false), @($true,'fresh',4900,900,$true)) },
+    @{ name = 'unknown ticks reset pending evidence and never fire (OEAE scenario)'; steps = @(@($true,'fresh',4000,0,$false), @($true,'fresh',4300,300,$false), @($false,'',0,600,$false), @($false,'',0,900,$false), @($true,'fresh',5500,1500,$false), @($true,'fresh',5800,1800,$false), @($true,'fresh',6100,2100,$false), @($true,'fresh',6400,2400,$true)) },
+    @{ name = 'stale heartbeat with stale last_update is not a miss (restart/index load)'; steps = @(@($true,'stale',9000,0,$false), @($true,'stale',9300,300,$false), @($true,'stale',9600,600,$false), @($true,'stale',9900,900,$false)) },
+    @{ name = 'unset last_update with fresh heartbeat counts as stale'; steps = @(@($true,'fresh','none',0,$false), @($true,'fresh','none',300,$false), @($true,'fresh','none',600,$false), @($true,'fresh','none',900,$true)) },
+    @{ name = 'a hit clears the streak'; steps = @(@($true,'fresh',4000,0,$false), @($true,'fresh',4300,300,$false), @($true,'fresh',50,600,$false), @($true,'fresh',4000,900,$false), @($true,'fresh',4300,1200,$false), @($true,'fresh',4600,1500,$false)) }
+  )
+  $fails = 0; $t0 = 1800000000
+  foreach ($c in $cases) {
+    $st = @{}; $ok = $true; $trace = @()
+    foreach ($s in $c.steps) {
+      $entry = $null; if ($s[0]) { $entry = [pscustomobject]@{ heartbeat_status = $s[1]; last_update = $(if ($s[2] -eq 'none') { $null } else { $t0 + $s[3] - $s[2] }) } }
+      $r = Update-NetViewState $st ([bool]$s[0]) $entry ([int64]($t0 + $s[3])) 3600
+      $trace += "t+$($s[3])s fire=$($r.fire) streak=$($r.streak)"
+      if ($r.fire -ne [bool]$s[4]) { $ok = $false }
+    }
+    if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
+  }
+  Write-Output "netview self-test: $($cases.Count - $fails)/$($cases.Count) passed"; exit $fails
 }
 
 # ---------- run ----------

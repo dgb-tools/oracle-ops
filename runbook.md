@@ -113,8 +113,8 @@ Two v9.26.6 behaviors that will show up and are not understood as failures:
 The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`
 in the config): a miss is a successful read with a fresh heartbeat and a stale `last_update`;
 the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
-fetch, a non-JSON body or an incomplete roster is never a miss; it holds the streak while the
-last good read is under thirty minutes old and resets it after that. The alert
+fetch, a non-JSON body or an incomplete roster is never a miss and can never fire or clear an
+alert: pending evidence is reset and any active alert is left standing until a good read. The alert
 asks you to corroborate; it does not tell you to cycle on the first read.
 
 ## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)

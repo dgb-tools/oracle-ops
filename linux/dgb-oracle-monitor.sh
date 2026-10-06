@@ -18,11 +18,11 @@ CONF="$BASE/config"
 LOG="$BASE/monitor.log"
 STATE="$BASE/state"
 
-[ -f "$CONF" ] || { echo "No config found at $CONF. Copy config.example to config and edit it." >&2; exit 1; }
+if [ "${1:-}" != "--netview-selftest" ]; then [ -f "$CONF" ] || { echo "No config found at $CONF. Copy config.example to config and edit it." >&2; exit 1; }; fi
 command -v jq   >/dev/null || { echo "jq is required (apt install jq / dnf install jq)." >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required." >&2; exit 1; }
 # shellcheck source=/dev/null
-. "$CONF"
+if [ "${1:-}" != "--netview-selftest" ]; then . "$CONF"; fi
 mkdir -p "$STATE"
 NOW=$(date -u +%s)
 
@@ -80,6 +80,26 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
 NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
+# Network-view state machine (pure except for the state files). Rules, per crew review 2026-10-06:
+#  MISS  = successful read, heartbeat fresh, last_update older than $5 seconds (or unset).
+#  FIRE  = a successful MISS that is the 3rd+ consecutive miss AND >= 900 s after the first of the streak.
+#  UNKNOWN (read not ok) = never a miss, never a hit, never fires, never clears: pending streak reset,
+#          alert state untouched (report_check is not called).
+# args: readok(1|0) heartbeat_status last_update(unix|0) now stale_seconds -> NV_FIRE NV_MISS NV_STREAK NV_AGE NV_MINUTES
+netview_update() {
+  local readok="$1" hb="$2" lu="$3" now="$4" stale="$5" streak since miss=0
+  streak=$(state_get net-miss 0); since=$(state_get net-miss-since "$now")
+  NV_FIRE=0; NV_MISS=0; NV_STREAK=0; NV_AGE=-1; NV_MINUTES=0
+  if [ "$readok" != "1" ]; then state_set net-miss 0; return 0; fi
+  NV_AGE=-1; [ "$lu" -gt 0 ] 2>/dev/null && NV_AGE=$((now - lu))
+  if [ "$hb" = "fresh" ] && { [ "$NV_AGE" -lt 0 ] || [ "$NV_AGE" -gt "$stale" ]; }; then miss=1; fi
+  if [ "$miss" = "1" ]; then [ "$streak" = "0" ] && since=$now; streak=$((streak + 1)); else streak=0; since=$now; fi
+  state_set net-miss "$streak"; state_set net-miss-since "$since"; state_set net-last-ok-read "$now"
+  NV_MISS=$miss; NV_STREAK=$streak; NV_MINUTES=$(( (now - since) / 60 ))
+  [ "$miss" = "1" ] && [ "$streak" -ge 3 ] && [ $((now - since)) -ge 900 ] && NV_FIRE=1
+  return 0
+}
+
 cli_mainnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet=0 -chain=main "$@" 2>/dev/null; }
 
 # Known crash classes, matched against the daemon's recent journal (or
@@ -226,40 +246,23 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
     fi
     report_check "$label-oracle$ORACLE_ID" "$reporting" "DGB ORACLE $ORACLE_ID ($label) NOT REPORTING" "$obody" urgent
     # NETWORK-VIEW check (mainnet only). The node's self-view cannot see a silent price broadcast
-    # (slot 29, Oct 2026: healthy locally, no price published for ~5 days). Ask a node we do not run.
-    # Its `status` churns every 40-block round (13/35, 10/35 and 35/35 "reporting" within an hour are
-    # all normal), so status is NOT the signal: a fresh heartbeat with a stale last_update is.
-    # Miss = successful read AND heartbeat fresh AND last_update older than NETVIEW_STALE_SECONDS.
-    # Alert after 3 consecutive misses spanning >= 15 min. Fetch failure / non-JSON / roster without
-    # 35 unique ids = unknown: never a miss; streak held while the last good read is < 30 min old, else reset.
+    # (slot 29, Oct 2026). Ask a node we do not run. The roster's `status` churns every 40-block
+    # round and is NOT the signal; a fresh heartbeat with a stale last_update is. Transitions live in
+    # netview_update (pure; --netview-selftest); this block only fetches and reports.
     if [ "$ismainnet" = "1" ]; then
-      local nraw nme nstat nsrc nhb nlu nage nmiss nsince nids netfail=0
+      local nraw nme nids nhb nlu readok=0
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
       nids=$(jq -r 'if type=="array" then [.[].oracle_id] | unique | length else 0 end' <<< "$nraw" 2>/dev/null || echo 0)
-      if [ "$nids" = "35" ]; then
-        nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
-        nstat="absent"; nsrc="n/a"; nhb="n/a"; nage=-1
-        if [ -n "$nme" ]; then
-          nstat=$(jq -r '.status // "unknown"' <<< "$nme"); nsrc=$(jq -r '.price_source // "n/a"' <<< "$nme"); nhb=$(jq -r '.heartbeat_status // "n/a"' <<< "$nme")
-          nlu=$(jq -r '.last_update // 0' <<< "$nme"); [ "$nlu" -gt 0 ] 2>/dev/null && nage=$((NOW - nlu))
-        fi
-        local ismiss=0
-        if [ -z "$nme" ]; then ismiss=1
-        elif [ "$nhb" = "fresh" ] && { [ "$nage" -lt 0 ] || [ "$nage" -gt "$NETVIEW_STALE_SECONDS" ]; }; then ismiss=1; fi
-        nmiss=$(state_get net-miss 0); nsince=$(state_get net-miss-since "$NOW")
-        if [ "$ismiss" = "1" ]; then [ "$nmiss" = "0" ] && nsince=$NOW; nmiss=$((nmiss + 1)); else nmiss=0; nsince=$NOW; fi
-        state_set net-miss "$nmiss"; state_set net-miss-since "$nsince"; state_set net-last-ok-read "$NOW"
-        [ "$nmiss" -ge 3 ] && [ $((NOW - nsince)) -ge 900 ] && netfail=1
-        local netok=1; [ "$netfail" = "1" ] && netok=0
+      nme=""; [ "$nids" = "35" ] && nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
+      if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // "n/a"' <<< "$nme"); nlu=$(jq -r '.last_update // 0' <<< "$nme"); else nhb=""; nlu=0; fi
+      netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS"   # sets NV_FIRE NV_MISS NV_STREAK NV_AGE NV_MINUTES
+      if [ "$readok" = "1" ]; then
+        local netok=1; [ "$NV_FIRE" = "1" ] && netok=0
         report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
-          "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${nage}s (heartbeat $nhb, status $nstat, price_source $nsrc) across $nmiss consecutive reads over $(( (NOW - nsince) / 60 )) minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
-        summary="$summary net-o$ORACLE_ID=$nstat/lu${nage}s"
+          "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
+        summary="$summary net-o$ORACLE_ID=$(jq -r '.status // "?"' <<< "$nme")/lu${NV_AGE}s"
       else
-        # Unknown read: never a miss. Streak HELD while the last good read is under 30 min old (a flaky
-        # endpoint cannot erase evidence); RESET once no good read for 30 min (a stuck counter cannot page).
-        local lastok; lastok=$(state_get net-last-ok-read 0)
-        if [ $((NOW - lastok)) -gt 1800 ]; then state_set net-miss 0; log "netview check unknown; no good read for 30 min, streak reset ($NETVIEW_URL)"
-        else log "netview check unknown; streak held ($NETVIEW_URL)"; fi
+        log "netview check unknown (pending evidence reset, alert state untouched): ids=$nids slot=$([ -n "$nme" ] && echo present || echo absent) from $NETVIEW_URL"
       fi
     fi
   else
@@ -272,6 +275,29 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
 if [ "${1:-}" = "--test" ]; then
   notify "DGB oracle monitor: test alert" "Monitor is installed and can reach you. Box time: $(date +%FT%T)" default wave
   exit 0
+fi
+
+
+if [ "${1:-}" = "--netview-selftest" ]; then
+  STATE=$(mktemp -d); t0=1800000000; fails=0; total=0
+  run_case() { # name; then steps "readok:hb:age|none:offset:expect" ...
+    local name="$1"; shift; local ok=1 trace=""; rm -f "$STATE"/net-*; total=$((total + 1))
+    for step in "$@"; do
+      IFS=: read -r ro hb age off exp <<< "$step"; local lu=0
+      if [ "$age" != "none" ]; then lu=$((t0 + off - age)); fi
+      netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600; trace="$trace t+${off}s fire=$NV_FIRE streak=$NV_STREAK |"
+      [ "$NV_FIRE" = "$exp" ] || ok=0
+    done
+    if [ "$ok" = "1" ]; then echo "PASS  $name"; else fails=$((fails + 1)); echo "FAIL  $name:$trace"; fi
+  }
+  run_case "healthy reads never fire" 1:fresh:70:0:0 1:fresh:120:300:0 1:fresh:40:600:0
+  run_case "three stale reads inside 10 min do NOT fire (elapsed gate)" 1:fresh:4000:0:0 1:fresh:4300:300:0 1:fresh:4600:600:0
+  run_case "fourth stale read at 15 min fires" 1:fresh:4000:0:0 1:fresh:4300:300:0 1:fresh:4600:600:0 1:fresh:4900:900:1
+  run_case "unknown ticks reset pending evidence and never fire (OEAE scenario)" 1:fresh:4000:0:0 1:fresh:4300:300:0 0::0:600:0 0::0:900:0 1:fresh:5500:1500:0 1:fresh:5800:1800:0 1:fresh:6100:2100:0 1:fresh:6400:2400:1
+  run_case "stale heartbeat with stale last_update is not a miss (restart/index load)" 1:stale:9000:0:0 1:stale:9300:300:0 1:stale:9600:600:0 1:stale:9900:900:0
+  run_case "unset last_update with fresh heartbeat counts as stale" 1:fresh:none:0:0 1:fresh:none:300:0 1:fresh:none:600:0 1:fresh:none:900:1
+  run_case "a hit clears the streak" 1:fresh:4000:0:0 1:fresh:4300:300:0 1:fresh:50:600:0 1:fresh:4000:900:0 1:fresh:4300:1200:0 1:fresh:4600:1500:0
+  echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 
 PARTS=""
