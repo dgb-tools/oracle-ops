@@ -16,6 +16,10 @@ $Cfg       = Get-Content "$Base\config.json" -Raw | ConvertFrom-Json
 $CliExe   = $Cfg.cli_exe
 $DataDir  = $Cfg.datadir
 $OracleId = [int]$Cfg.oracle_id
+# Network view: a node we do not run, asked what it sees for our slot. Default is digibyte.io's node.
+# Optional config key: network_view_url. Keep this at the monitor's cadence; the endpoint is unauthenticated.
+$NetViewUrl = 'https://digibyte.io/api/getoracles'
+if ($Cfg.PSObject.Properties['network_view_url'] -and $Cfg.network_view_url) { $NetViewUrl = [string]$Cfg.network_view_url }
 $TestArgs = @('-testnet')
 $MainArgs = @('-testnet=0', '-chain=main')
 $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -206,6 +210,37 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     Report-Check "$Label-oracle$OracleId" $reporting "DGB ORACLE $OracleId ($Label) NOT REPORTING" $body 'urgent'
     if ($me) { $summary += "$Label-o$OracleId=$($me.status)/$($me.heartbeat_status)" }
     else     { $summary += "$Label-o$OracleId=missing" }
+    # NETWORK-VIEW check (mainnet only). Never name a local '$net' in this function: PowerShell variable names
+    # are case-insensitive and it would be the [string[]]$Net parameter, stringifying the roster.
+    # The node's self-view cannot see a silent price broadcast (slot 29, Oct 2026: the oracle auto-started
+    # after an upgrade, reported healthy locally, and published no price for about five days). Ask a node
+    # we do not run what it sees for our slot. Its no_data set churns every oracle round, so three
+    # consecutive misses (15 minutes at the 5-minute cadence) are required. A fetch failure, a non-JSON body
+    # or a short roster is logged and does NOT count as a miss: an outage must never page as "invisible".
+    if ($IsMainnet) {
+      try {
+        $raw = Invoke-WebRequest -Uri $NetViewUrl -UseBasicParsing -TimeoutSec 20 `
+          -Headers @{ 'User-Agent' = "dgb-oracle-monitor (slot $OracleId)"; 'Accept' = 'application/json' }
+        $netRoster = $null; try { $netRoster = $raw.Content | ConvertFrom-Json } catch {}
+        if (-not $netRoster -or @($netRoster).Count -lt 30) { throw "unexpected roster payload: http=$($raw.StatusCode) len=$($raw.Content.Length)" }
+        $nme = $netRoster | Where-Object { $_.oracle_id -eq $OracleId }
+        $netOk = [bool]($nme -and ($nme.status -eq 'reporting'))
+        $miss = 0; if ($State.ContainsKey('net-miss')) { $miss = [int]$State['net-miss'] }
+        if ($netOk) { $miss = 0 } else { $miss = $miss + 1 }
+        $State['net-miss'] = $miss
+        $netFail = ($miss -ge 3)
+        $nstat = 'absent'; $nsrc = 'n/a'
+        if ($nme) { $nstat = $nme.status; $nsrc = $nme.price_source }
+        $localStatus = 'missing'; if ($me) { $localStatus = $me.status }
+        Report-Check "$Label-oracle$OracleId-networkview" (-not $netFail) "DGB ORACLE $OracleId INVISIBLE TO NETWORK" `
+          ("The network-view node sees slot $OracleId as status=$nstat price_source=$nsrc for $miss consecutive checks " +
+           "while this node reports status=$localStatus. The price broadcast is likely silent. Fix (wallet must be unlocked):`n" +
+           "digibyte-cli -testnet=0 -chain=main -rpcwallet=$($Cfg.oracle_wallet) stoporacle $OracleId`n" +
+           "digibyte-cli -testnet=0 -chain=main -rpcwallet=$($Cfg.oracle_wallet) startoracle $OracleId`n" +
+           "Then confirm on $NetViewUrl within a few minutes. See runbook.md: after any restart or upgrade.") 'urgent'
+        $summary += " net-o$OracleId=$nstat"
+      } catch { Log "netview check failed (not counted as a miss): $($_.Exception.Message)" }
+    }
   } else {
     $summary += "$Label-o$OracleId=staged(pre-activation)"
   }
