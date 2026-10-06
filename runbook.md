@@ -80,33 +80,39 @@ Observed on slot 29, 2026-10-01 to 2026-10-06: after the v9.26.6 upgrade the ora
 auto-started on wallet unlock before the new per-round state existed, and its price
 thread never broadcast. For about five days the node's own `listoracle` said running and
 price-updating, heartbeats went out, and the network never received a price from the slot.
-The node's self-view cannot see this failure.
+The node's self-view cannot see this failure. Only a node you do not run can.
 
-1. After the oracle starts, wait fifteen minutes, then read the public roster that
-   digibyte.io serves from its own node:
-   `https://digibyte.io/api/getoracles` (same shape as a local `getoracles`; one entry per
-   slot with `status`, `heartbeat_status`, `price_source`, `last_update`).
-2. Your slot should show `status: reporting` with a recent `last_update`. If it shows
-   `no_data` for fifteen minutes or more while `heartbeat_status` is `fresh`, cycle the
-   oracle: `stoporacle N`, then `startoracle N` (wallet unlocked). On slot 29 the roster
-   showed reporting within two minutes and the next signed bundle included the slot four
-   minutes later.
-3. Do not read a single `no_data` as failure. Each node's view of `no_data` slots changes
-   every round (40 blocks): one read showed 13 reporting and 22 `no_data`, the next a
-   different set. Require three consecutive non-reporting reads, about fifteen minutes.
+1. After the oracle starts, wait fifteen minutes, then read a roster served by a node you do
+   not run. digibyte.io publishes its node's view at `https://digibyte.io/api/getoracles`
+   (one entry per slot: `status`, `heartbeat_status`, `last_update`, `price_source`). It is one
+   observer's current-round sample, not network proof, and it is unauthenticated with no
+   published rate limit: read it at monitor cadence, never from a feed.
+2. **Read `last_update`, not `status`.** `status` churns every 40-block round: three reads
+   within one hour on 2026-10-06 showed 13, 10 and 35 of 35 slots "reporting", all with fresh
+   heartbeats, and every one of those nodes was healthy. `last_update` is the last price the
+   observer received from your slot: on healthy slots it reads under about twelve minutes;
+   on a silent slot it reads hours or days while the heartbeat stays `fresh`.
+3. The failure signature is therefore: heartbeat `fresh` **and** `last_update` older than an
+   hour, on three reads spanning at least fifteen minutes. One stale read is not a signal.
+4. Corroborate before acting: read the roster again in fifteen minutes and check your own
+   `listoracle`. If the signature holds, cycle the oracle: `stoporacle N`, then `startoracle N`
+   (wallet unlocked). On slot 29 the observer showed a fresh `last_update` within two minutes
+   and the next signed bundle included the slot four minutes later.
 
-Two v9.26.6 behaviors that look alarming and are not:
+Two v9.26.6 behaviors that will show up and are not understood as failures:
 
-- `Oracle: Manually cleared all pending messages and attestations` in `debug.log` every one
-  or two blocks on every node. It is the per-round pending-state reset.
-- A "reporting" count that churns from read to read (9, then 35, then 17 within minutes on
-  one node). It is a per-round sample, not a network health number. Heartbeats are the
-  stable availability signal; price feeds are per round.
+- `Oracle: Manually cleared all pending messages and attestations` in `debug.log` every one or
+  two blocks, on every node observed so far. It coincides with the per-round reset. Its full
+  meaning has not been confirmed from source; it has not been associated with any failure.
+- A "reporting" count that churns from read to read (9, then 35, then 17 within minutes on one
+  node). It is a per-round sample, not a network health number. Heartbeats are the stable
+  availability signal; price receipts per slot are read from `last_update`.
 
-The monitors in this kit still check only the node's own view. Slot 29's monitor now also
-polls the digibyte.io roster for its slot each cycle and pages after three consecutive
-non-reporting reads, with fetch failures counted as unknown rather than as misses. That
-check is being brought into this kit; until then, do step 1 by hand after every restart.
+The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`
+in the config): a miss is a successful read with a fresh heartbeat and a stale `last_update`;
+the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
+fetch, a non-JSON body or an incomplete roster resets the streak and is never a miss. The alert
+asks you to corroborate; it does not tell you to cycle on the first read.
 
 ## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
 

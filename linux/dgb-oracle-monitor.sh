@@ -79,6 +79,7 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Network view: a node we do not run, asked what it sees for our slot (default digibyte.io's node).
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
+NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
 cli_mainnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet=0 -chain=main "$@" 2>/dev/null; }
 
 # Known crash classes, matched against the daemon's recent journal (or
@@ -226,28 +227,36 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
     report_check "$label-oracle$ORACLE_ID" "$reporting" "DGB ORACLE $ORACLE_ID ($label) NOT REPORTING" "$obody" urgent
     # NETWORK-VIEW check (mainnet only). The node's self-view cannot see a silent price broadcast
     # (slot 29, Oct 2026: healthy locally, no price published for ~5 days). Ask a node we do not run.
-    # Its no_data set churns every oracle round: require 3 consecutive misses (15 min at 5-min cadence).
-    # Fetch failure / non-JSON / short roster is logged and never counted as a miss.
+    # Its `status` churns every 40-block round (13/35, 10/35 and 35/35 "reporting" within an hour are
+    # all normal), so status is NOT the signal: a fresh heartbeat with a stale last_update is.
+    # Miss = successful read AND heartbeat fresh AND last_update older than NETVIEW_STALE_SECONDS.
+    # Alert after 3 consecutive misses spanning >= 15 min. Fetch failure / non-JSON / roster without
+    # 35 unique ids = unknown: logged, streak reset, never a miss.
     if [ "$ismainnet" = "1" ]; then
-      local nraw nme nstat nsrc nmiss netfail=0
+      local nraw nme nstat nsrc nhb nlu nage nmiss nsince nids netfail=0
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
-      if [ -n "$nraw" ] && [ "$(jq -r 'if type=="array" then length else 0 end' <<< "$nraw" 2>/dev/null || echo 0)" -ge 30 ]; then
+      nids=$(jq -r 'if type=="array" then [.[].oracle_id] | unique | length else 0 end' <<< "$nraw" 2>/dev/null || echo 0)
+      if [ "$nids" = "35" ]; then
         nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
-        nstat="absent"; nsrc="n/a"
-        if [ -n "$nme" ]; then nstat=$(jq -r '.status // "unknown"' <<< "$nme"); nsrc=$(jq -r '.price_source // "n/a"' <<< "$nme"); fi
-        nmiss=$(state_get net-miss 0)
-        if [ "$nstat" = "reporting" ]; then nmiss=0; else nmiss=$((nmiss + 1)); fi
-        state_set net-miss "$nmiss"
-        [ "$nmiss" -ge 3 ] && netfail=1
+        nstat="absent"; nsrc="n/a"; nhb="n/a"; nage=-1
+        if [ -n "$nme" ]; then
+          nstat=$(jq -r '.status // "unknown"' <<< "$nme"); nsrc=$(jq -r '.price_source // "n/a"' <<< "$nme"); nhb=$(jq -r '.heartbeat_status // "n/a"' <<< "$nme")
+          nlu=$(jq -r '.last_update // 0' <<< "$nme"); [ "$nlu" -gt 0 ] 2>/dev/null && nage=$((NOW - nlu))
+        fi
+        local ismiss=0
+        if [ -z "$nme" ]; then ismiss=1
+        elif [ "$nhb" = "fresh" ] && { [ "$nage" -lt 0 ] || [ "$nage" -gt "$NETVIEW_STALE_SECONDS" ]; }; then ismiss=1; fi
+        nmiss=$(state_get net-miss 0); nsince=$(state_get net-miss-since "$NOW")
+        if [ "$ismiss" = "1" ]; then [ "$nmiss" = "0" ] && nsince=$NOW; nmiss=$((nmiss + 1)); else nmiss=0; nsince=$NOW; fi
+        state_set net-miss "$nmiss"; state_set net-miss-since "$nsince"
+        [ "$nmiss" -ge 3 ] && [ $((NOW - nsince)) -ge 900 ] && netfail=1
         local netok=1; [ "$netfail" = "1" ] && netok=0
-        report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID INVISIBLE TO NETWORK" \
-          "The network-view node sees slot $ORACLE_ID as status=$nstat price_source=$nsrc for $nmiss consecutive checks while this node reports ${detail}. The price broadcast is likely silent. Fix (wallet must be unlocked):
-digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET stoporacle $ORACLE_ID
-digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACLE_ID
-Then confirm on $NETVIEW_URL within a few minutes. See runbook.md: after any restart or upgrade." urgent
-        summary="$summary net-o$ORACLE_ID=$nstat"
+        report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
+          "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${nage}s (heartbeat $nhb, status $nstat, price_source $nsrc) across $nmiss consecutive reads over $(( (NOW - nsince) / 60 )) minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
+        summary="$summary net-o$ORACLE_ID=$nstat/lu${nage}s"
       else
-        log "netview check failed (not counted as a miss): empty, non-JSON, or short roster from $NETVIEW_URL"
+        state_set net-miss 0
+        log "netview check unknown (streak reset, not a miss): empty, non-JSON, or roster without 35 unique ids from $NETVIEW_URL"
       fi
     fi
   else

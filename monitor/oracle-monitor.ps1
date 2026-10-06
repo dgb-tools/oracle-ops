@@ -19,6 +19,8 @@ $OracleId = [int]$Cfg.oracle_id
 # Network view: a node we do not run, asked what it sees for our slot. Default is digibyte.io's node.
 # Optional config key: network_view_url. Keep this at the monitor's cadence; the endpoint is unauthenticated.
 $NetViewUrl = 'https://digibyte.io/api/getoracles'
+$NetViewStaleSeconds = 3600   # last_update older than this, with a fresh heartbeat, is a miss (healthy slots read minutes)
+if ($Cfg.PSObject.Properties['network_view_stale_seconds'] -and $Cfg.network_view_stale_seconds) { $NetViewStaleSeconds = [int]$Cfg.network_view_stale_seconds }
 if ($Cfg.PSObject.Properties['network_view_url'] -and $Cfg.network_view_url) { $NetViewUrl = [string]$Cfg.network_view_url }
 $TestArgs = @('-testnet')
 $MainArgs = @('-testnet=0', '-chain=main')
@@ -214,32 +216,42 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     # are case-insensitive and it would be the [string[]]$Net parameter, stringifying the roster.
     # The node's self-view cannot see a silent price broadcast (slot 29, Oct 2026: the oracle auto-started
     # after an upgrade, reported healthy locally, and published no price for about five days). Ask a node
-    # we do not run what it sees for our slot. Its no_data set churns every oracle round, so three
-    # consecutive misses (15 minutes at the 5-minute cadence) are required. A fetch failure, a non-JSON body
-    # or a short roster is logged and does NOT count as a miss: an outage must never page as "invisible".
+    # we do not run what it sees for our slot. Predicate, per review: the roster's `status` churns every
+    # 40-block round (reads of 13/35, 10/35 and 35/35 "reporting" within one hour are all normal), so status
+    # is NOT the signal. The signal is a fresh heartbeat with a stale `last_update` (the last price the
+    # observer received from us): healthy slots read under ~12 minutes; a silent slot reads hours or days.
+    # A miss = successful read AND heartbeat fresh AND last_update older than NetViewStaleSeconds.
+    # Alert after 3 consecutive misses spanning at least 15 minutes. A fetch failure, non-JSON body or an
+    # incomplete roster (not 35 unique ids) is "unknown": logged, streak reset, never a miss.
     if ($IsMainnet) {
       try {
         $raw = Invoke-WebRequest -Uri $NetViewUrl -UseBasicParsing -TimeoutSec 20 `
           -Headers @{ 'User-Agent' = "dgb-oracle-monitor (slot $OracleId)"; 'Accept' = 'application/json' }
         $netRoster = $null; try { $netRoster = $raw.Content | ConvertFrom-Json } catch {}
-        if (-not $netRoster -or @($netRoster).Count -lt 30) { throw "unexpected roster payload: http=$($raw.StatusCode) len=$($raw.Content.Length)" }
+        $ids = @(); if ($netRoster) { $ids = @($netRoster | ForEach-Object { $_.oracle_id } | Sort-Object -Unique) }
+        if ($ids.Count -ne 35) { throw "roster incomplete or malformed: $($ids.Count) unique ids, http=$($raw.StatusCode)" }
         $nme = $netRoster | Where-Object { $_.oracle_id -eq $OracleId }
-        $netOk = [bool]($nme -and ($nme.status -eq 'reporting'))
-        $miss = 0; if ($State.ContainsKey('net-miss')) { $miss = [int]$State['net-miss'] }
-        if ($netOk) { $miss = 0 } else { $miss = $miss + 1 }
-        $State['net-miss'] = $miss
-        $netFail = ($miss -ge 3)
-        $nstat = 'absent'; $nsrc = 'n/a'
-        if ($nme) { $nstat = $nme.status; $nsrc = $nme.price_source }
+        $nowU = [int64][double]::Parse((Get-Date -UFormat %s))
+        $luAge = -1; if ($nme -and $nme.last_update) { $luAge = $nowU - [int64]$nme.last_update }
+        $hbFresh = [bool]($nme -and ($nme.heartbeat_status -eq 'fresh'))
+        $miss = [bool]((-not $nme) -or ($hbFresh -and ($luAge -lt 0 -or $luAge -gt $NetViewStaleSeconds)))
+        $streak = 0; $since = $nowU
+        if ($State.ContainsKey('net-miss')) { $streak = [int]$State['net-miss'] }
+        if ($State.ContainsKey('net-miss-since')) { $since = [int64]$State['net-miss-since'] }
+        if ($miss) { if ($streak -eq 0) { $since = $nowU }; $streak = $streak + 1 } else { $streak = 0; $since = $nowU }
+        $State['net-miss'] = $streak; $State['net-miss-since'] = $since
+        $netFail = ($streak -ge 3) -and (($nowU - $since) -ge 900)
+        $nstat = 'absent'; $nsrc = 'n/a'; $nhb = 'n/a'
+        if ($nme) { $nstat = $nme.status; $nsrc = $nme.price_source; $nhb = $nme.heartbeat_status }
         $localStatus = 'missing'; if ($me) { $localStatus = $me.status }
-        Report-Check "$Label-oracle$OracleId-networkview" (-not $netFail) "DGB ORACLE $OracleId INVISIBLE TO NETWORK" `
-          ("The network-view node sees slot $OracleId as status=$nstat price_source=$nsrc for $miss consecutive checks " +
-           "while this node reports status=$localStatus. The price broadcast is likely silent. Fix (wallet must be unlocked):`n" +
-           "digibyte-cli -testnet=0 -chain=main -rpcwallet=$($Cfg.oracle_wallet) stoporacle $OracleId`n" +
-           "digibyte-cli -testnet=0 -chain=main -rpcwallet=$($Cfg.oracle_wallet) startoracle $OracleId`n" +
-           "Then confirm on $NetViewUrl within a few minutes. See runbook.md: after any restart or upgrade.") 'urgent'
-        $summary += " net-o$OracleId=$nstat"
-      } catch { Log "netview check failed (not counted as a miss): $($_.Exception.Message)" }
+        Report-Check "$Label-oracle$OracleId-networkview" (-not $netFail) "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" `
+          ("The observer at $NetViewUrl has not received a price from slot $OracleId for $luAge seconds " +
+           "(heartbeat $nhb, status $nstat, price_source $nsrc) across $streak consecutive reads over $([int](($nowU - $since)/60)) minutes, " +
+           "while this node reports status=$localStatus. This is one observer's view, not network proof. Corroborate first: " +
+           "read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, " +
+           "the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix.") 'urgent'
+        $summary += " net-o$OracleId=$nstat/lu${luAge}s"
+      } catch { $State['net-miss'] = 0; Log "netview check unknown (streak reset, not a miss): $($_.Exception.Message)" }
     }
   } else {
     $summary += "$Label-o$OracleId=staged(pre-activation)"

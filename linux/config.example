@@ -42,3 +42,4 @@ HEARTBEAT_HOUR=9         # earliest local hour for the daily heartbeat
 MIN_FREE_DISK_GB=15
 # A node you do not run, asked what it sees for your slot (keep at monitor cadence):
 NETVIEW_URL="https://digibyte.io/api/getoracles"
+NETVIEW_STALE_SECONDS=3600
