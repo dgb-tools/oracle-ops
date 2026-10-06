@@ -89,7 +89,9 @@ The node's self-view cannot see this failure. Only a node you do not run can.
    published rate limit: read it at monitor cadence, never from a feed.
 2. **Read `last_update`, not `status`.** `status` churns every 40-block round: three reads
    within one hour on 2026-10-06 showed 13, 10 and 35 of 35 slots "reporting", all with fresh
-   heartbeats, and every one of those nodes was healthy. `last_update` is the last price the
+   heartbeats, and every one of those nodes was healthy; a 12-read sample on the slot-29 box the
+   same day sat at 11 to 16 of 35 for consecutive rounds, with slot 29 itself "reporting" in 7
+   of the 12 while signing normally. `last_update` is the last price the
    observer received from your slot: on healthy slots it reads under about twelve minutes;
    on a silent slot it reads hours or days while the heartbeat stays `fresh`.
 3. The failure signature is therefore: heartbeat `fresh` **and** `last_update` older than an
