@@ -80,6 +80,19 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
 NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
+# Roster validator (pure). "ok" only when: JSON array; row count == unique oracle_id count == 35 (a deliberate
+# compatibility restriction to the current mainnet roster size, not proof of completeness); every row is an object
+# with an integer oracle_id, string status, string heartbeat_status, and an explicitly present integer last_update
+# (0 is the never-received sentinel; null or missing is a schema failure, not a sentinel). Anything else: "bad".
+netview_validate() {
+  jq -r 'if type=="array" and length==35 and ([.[].oracle_id] | unique | length)==35
+            and all(.[]; type=="object"
+                        and (.oracle_id|type=="number") and (.oracle_id == (.oracle_id|floor))
+                        and (.status|type=="string") and (.heartbeat_status|type=="string")
+                        and has("last_update") and (.last_update|type=="number") and (.last_update == (.last_update|floor)) and (.last_update >= 0))
+         then "ok" else "bad" end' <<< "$1" 2>/dev/null || echo bad
+}
+
 # Network-view state machine (pure except for the state files). Rules, per crew review 2026-10-06/07.
 # Outcomes (NV_OUTCOME): miss | hit | outofscope | unknown
 #  miss       = read ok, heartbeat fresh, last_update is the "never received" sentinel (0/missing) or
@@ -99,7 +112,7 @@ netview_update() {
   NV_OUTCOME=unknown; NV_FIRE=0; NV_STREAK=0; NV_AGE=-1; NV_MINUTES=0
   if [ "$readok" != "1" ]; then state_set net-miss 0; return 0; fi
   # last_update: "" / null / 0 = never received (sentinel); non-integer or future = malformed -> unknown
-  case "$lu" in ''|null|0) NV_AGE=-1 ;; *[!0-9]*) state_set net-miss 0; return 0 ;; *) NV_AGE=$((now - lu)); if [ "$NV_AGE" -lt -300 ]; then state_set net-miss 0; return 0; fi; [ "$NV_AGE" -lt 0 ] && NV_AGE=0 ;; esac
+  case "$lu" in 0) NV_AGE=-1 ;; ''|null|*[!0-9]*) state_set net-miss 0; return 0 ;; *) NV_AGE=$((now - lu)); if [ "$NV_AGE" -lt -300 ]; then state_set net-miss 0; return 0; fi; [ "$NV_AGE" -lt 0 ] && NV_AGE=0 ;; esac
   if [ "$hb" != "fresh" ]; then NV_OUTCOME=outofscope; state_set net-miss 0; return 0; fi
   if [ "$NV_AGE" -lt 0 ] || [ "$NV_AGE" -gt "$stale" ]; then NV_OUTCOME=miss; else NV_OUTCOME=hit; fi
   if [ "$NV_OUTCOME" = "miss" ]; then [ "$streak" = "0" ] && since=$now; streak=$((streak + 1)); else streak=0; since=$now; fi
@@ -262,10 +275,7 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
     if [ "$ismainnet" = "1" ]; then
       local nraw nme nvalid nhb nlu readok=0
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
-      # schema: array of objects with integer oracle_id, string status, string heartbeat_status, last_update number or null.
-      # The 35-unique-ids requirement is a deliberate compatibility restriction to the current mainnet roster size
-      # (consensus.nOracleTotalOracles = 35); it is not proof that the response is complete or correct.
-      nvalid=$(jq -r 'if type=="array" and length>0 and all(.[]; type=="object" and (.oracle_id|type=="number") and (.status|type=="string") and (.heartbeat_status|type=="string") and ((.last_update|type)=="number" or (.last_update|type)=="null")) and ([.[].oracle_id]|unique|length)==35 then "ok" else "bad" end' <<< "$nraw" 2>/dev/null || echo bad)
+      nvalid=$(netview_validate "$nraw")
       nme=""; [ "$nvalid" = "ok" ] && nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
       if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme"); else nhb=""; nlu=""; fi
       netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS"
@@ -302,7 +312,7 @@ if [ "${1:-}" = "--netview-selftest" ]; then
     local name="$1"; shift; local ok=1 trace="" alert=0; rm -f "$STATE"/net-*; total=$((total + 1))
     for step in "$@"; do
       IFS=: read -r ro hb age off expf expa <<< "$step"; local lu=""
-      case "$age" in none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; soon) lu=$((t0 + off + 120)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
+      case "$age" in zero) lu=0 ;; none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; soon) lu=$((t0 + off + 120)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
       netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600
       # caller wiring under test: alert set only on fire; cleared only on hit; otherwise untouched
       if [ "$NV_FIRE" = "1" ]; then alert=1; elif [ "$NV_OUTCOME" = "hit" ]; then alert=0; fi
@@ -316,13 +326,20 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case "fourth stale read at 15 min fires" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1
   run_case "unknown ticks reset pending evidence and never fire (OEAE scenario)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 0::0:600:0:0 0::0:900:0:0 1:fresh:5500:1500:0:0 1:fresh:5800:1800:0:0 1:fresh:6100:2100:0:0 1:fresh:6400:2400:1:1
   run_case "stale heartbeat with stale last_update is out of scope, not a miss" 1:stale:9000:0:0:0 1:stale:9300:300:0:0 1:stale:9600:600:0:0 1:stale:9900:900:0:0
-  run_case "never-received sentinel with fresh heartbeat counts as stale" 1:fresh:none:0:0:0 1:fresh:none:300:0:0 1:fresh:none:600:0:0 1:fresh:none:900:1:1
+  run_case "never-received sentinel (explicit 0) with fresh heartbeat counts as stale" 1:fresh:zero:0:0:0 1:fresh:zero:300:0:0 1:fresh:zero:600:0:0 1:fresh:zero:900:1:1
+  run_case "empty last_update reaching the state machine is unknown, never a miss" 1:fresh:none:0:0:0 1:fresh:none:300:0:0 1:fresh:none:600:0:0 1:fresh:none:900:0:0
   run_case "a hit clears pending evidence" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:50:600:0:0 1:fresh:4000:900:0:0 1:fresh:4300:1200:0:0 1:fresh:4600:1500:0:0
   run_case "active alert survives unknown reads (unconfirmed, not recovered)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 0::0:1200:0:1 0::0:1500:0:1
   run_case "active alert survives a stale heartbeat (restart does not count as recovery)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:stale:5200:1200:0:1 1:stale:5500:1500:0:1
   run_case "malformed and future timestamps are unknown: never fire, never clear" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:bad:1200:0:1 1:fresh:future:1500:0:1
   run_case "last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:soon:1200:0:0
   run_case "confirmed recovery clears the alert" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:60:1200:0:0
+  # validator against the shared fixtures
+  fxdir="$(cd "$(dirname "$0")/.." && pwd)/test/netview-fixtures"
+  for f in "$fxdir"/*.json; do n=$(basename "$f"); [ "$n" = "expected.json" ] && continue
+    exp=$(jq -r --arg n "$n" '.[$n]' "$fxdir/expected.json"); got=$(netview_validate "$(cat "$f")"); total=$((total + 1))
+    if [ "$got" = "$exp" ]; then echo "PASS  validator: $n -> $got"; else fails=$((fails + 1)); echo "FAIL  validator: $n expected $exp got $got"; fi
+  done
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 

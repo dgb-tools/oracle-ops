@@ -125,6 +125,27 @@ function Get-CrashClass([string]$ChainLabel) {
 }
 
 # ---------- per-chain checks ----------
+# Roster validator (pure). Equivalent to the bash netview_validate: $true only when the parsed body is an array of
+# exactly 35 objects whose oracle_id values are 35 unique integers, each with a string status, a string
+# heartbeat_status, and an explicitly present integer last_update >= 0 (0 is the never-received sentinel; null or
+# missing is a schema failure). Types are tested before any conversion; fractional or string ids are rejected.
+function Test-NetViewRoster($Roster) {
+  if ($null -eq $Roster) { return $false }
+  $rows = @($Roster); if ($rows.Count -ne 35) { return $false }
+  $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) -or ($v -is [int16]) -or ($v -is [byte]) -or (($v -is [double] -or $v -is [decimal]) -and ($v -eq [math]::Floor($v))) }
+  $ids = @()
+  foreach ($e in $rows) {
+    if ($null -eq $e -or $e -is [string] -or $e -is [array]) { return $false }
+    foreach ($k in 'oracle_id','status','heartbeat_status','last_update') { if (-not $e.PSObject.Properties[$k]) { return $false } }
+    if (-not (& $isInt $e.oracle_id)) { return $false }
+    if (-not ($e.status -is [string]) -or -not ($e.heartbeat_status -is [string])) { return $false }
+    if ($null -eq $e.last_update -or -not (& $isInt $e.last_update) -or ($e.last_update -lt 0)) { return $false }
+    $ids += [int64]$e.oracle_id
+  }
+  if (@($ids | Sort-Object -Unique).Count -ne 35) { return $false }
+  return $true
+}
+
 # Network-view state machine (pure; no I/O). Rules, per crew review 2026-10-06/07. Outcomes:
 #  miss       = read ok, heartbeat 'fresh', last_update is the never-received sentinel (0/null) or older than
 #               $StaleSeconds. Pending evidence accrues.
@@ -142,7 +163,8 @@ function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU
   $res = @{ outcome = 'unknown'; fire = $false; streak = 0; age = -1; minutes = 0 }
   if (-not $ReadOk) { $St['net-miss'] = 0; return $res }
   $age = -1; $lu = $Entry.last_update
-  if ($null -ne $lu -and "$lu" -ne '' -and "$lu" -ne '0') {
+  if ($null -eq $lu -or "$lu" -eq '') { $St['net-miss'] = 0; return $res }            # null/missing: schema failure upstream; unknown here
+  if ("$lu" -ne '0') {
     $luN = 0L; if (-not [int64]::TryParse("$lu", [ref]$luN)) { $St['net-miss'] = 0; return $res }
     $age = $NowU - $luN; if ($age -lt -300) { $St['net-miss'] = 0; return $res }; if ($age -lt 0) { $age = 0 }
   }
@@ -257,15 +279,9 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
       try {
         $raw = Invoke-WebRequest -Uri $NetViewUrl -UseBasicParsing -TimeoutSec 20 `
           -Headers @{ 'User-Agent' = "dgb-oracle-monitor (slot $OracleId)"; 'Accept' = 'application/json' }
-        $netRoster = $null; try { $netRoster = @($raw.Content | ConvertFrom-Json) } catch {}
-        if (-not $netRoster -or $netRoster.Count -eq 0) { throw "roster body is not a JSON array" }
-        foreach ($e in $netRoster) {
-          if (-not ($e.PSObject.Properties['oracle_id'] -and $e.PSObject.Properties['status'] -and $e.PSObject.Properties['heartbeat_status'])) { throw "roster entry missing oracle_id/status/heartbeat_status" }
-        }
-        $ids = @($netRoster | ForEach-Object { [int]$_.oracle_id } | Sort-Object -Unique)
-        # 35 unique ids is a deliberate compatibility restriction to the current mainnet roster size
-        # (consensus.nOracleTotalOracles = 35), not proof that the response is complete or correct.
-        if ($ids.Count -ne 35) { throw "roster completeness unconfirmed: $($ids.Count) unique ids" }
+        $netRoster = $null; try { $netRoster = $raw.Content | ConvertFrom-Json } catch {}
+        if (-not (Test-NetViewRoster $netRoster)) { throw "roster failed schema/completeness check (array of 35 objects, 35 unique integer ids, typed fields, explicit integer last_update)" }
+        $netRoster = @($netRoster)
         $nme = $netRoster | Where-Object { [int]$_.oracle_id -eq $OracleId } | Select-Object -First 1
         if (-not $nme) { throw "slot $OracleId absent; configuration or response completeness unconfirmed" }
         $readOk = $true
@@ -304,7 +320,8 @@ if ($NetViewSelfTest) {
     @{ name = 'fourth stale read at 15 min fires'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1)) },
     @{ name = 'unknown ticks reset pending evidence and never fire (OEAE scenario)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($false,'',0,600,$false,0), @($false,'',0,900,$false,0), @($true,'fresh',5500,1500,$false,0), @($true,'fresh',5800,1800,$false,0), @($true,'fresh',6100,2100,$false,0), @($true,'fresh',6400,2400,$true,1)) },
     @{ name = 'stale heartbeat with stale last_update is out of scope, not a miss'; steps = @(@($true,'stale',9000,0,$false,0), @($true,'stale',9300,300,$false,0), @($true,'stale',9600,600,$false,0), @($true,'stale',9900,900,$false,0)) },
-    @{ name = 'never-received sentinel with fresh heartbeat counts as stale'; steps = @(@($true,'fresh','none',0,$false,0), @($true,'fresh','none',300,$false,0), @($true,'fresh','none',600,$false,0), @($true,'fresh','none',900,$true,1)) },
+    @{ name = 'never-received sentinel (explicit 0) with fresh heartbeat counts as stale'; steps = @(@($true,'fresh','zero',0,$false,0), @($true,'fresh','zero',300,$false,0), @($true,'fresh','zero',600,$false,0), @($true,'fresh','zero',900,$true,1)) },
+    @{ name = 'null last_update reaching the state machine is unknown, never a miss'; steps = @(@($true,'fresh','none',0,$false,0), @($true,'fresh','none',300,$false,0), @($true,'fresh','none',600,$false,0), @($true,'fresh','none',900,$false,0)) },
     @{ name = 'a hit clears pending evidence'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',50,600,$false,0), @($true,'fresh',4000,900,$false,0), @($true,'fresh',4300,1200,$false,0), @($true,'fresh',4600,1500,$false,0)) },
     @{ name = 'active alert survives unknown reads (unconfirmed, not recovered)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($false,'',0,1200,$false,1), @($false,'',0,1500,$false,1)) },
     @{ name = 'active alert survives a stale heartbeat (restart does not count as recovery)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'stale',5200,1200,$false,1), @($true,'stale',5500,1500,$false,1)) },
@@ -319,7 +336,7 @@ if ($NetViewSelfTest) {
       $entry = $null
       if ($s[0]) {
         $lu = $null
-        switch ("$($s[2])") { 'none' { $lu = $null } 'future' { $lu = $t0 + $s[3] + 3600 } 'soon' { $lu = $t0 + $s[3] + 120 } 'bad' { $lu = '12abc' } default { $lu = $t0 + $s[3] - [int]$s[2] } }
+        switch ("$($s[2])") { 'zero' { $lu = 0 } 'none' { $lu = $null } 'future' { $lu = $t0 + $s[3] + 3600 } 'soon' { $lu = $t0 + $s[3] + 120 } 'bad' { $lu = '12abc' } default { $lu = $t0 + $s[3] - [int]$s[2] } }
         $entry = [pscustomobject]@{ heartbeat_status = $s[1]; last_update = $lu }
       }
       $r = Update-NetViewState $st ([bool]$s[0]) $entry ([int64]($t0 + $s[3])) 3600
@@ -329,7 +346,16 @@ if ($NetViewSelfTest) {
     }
     if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
   }
-  Write-Output "netview self-test: $($cases.Count - $fails)/$($cases.Count) passed"; exit $fails
+  # validator against the shared fixtures
+  $total = $cases.Count
+  $fxdir = Join-Path (Split-Path -Parent $PSScriptRoot) 'test\netview-fixtures'
+  $expected = Get-Content (Join-Path $fxdir 'expected.json') -Raw | ConvertFrom-Json
+  foreach ($f in Get-ChildItem $fxdir -Filter '*.json' | Where-Object { $_.Name -ne 'expected.json' }) {
+    $total++; $exp = $expected.($f.Name); $parsed = $null; try { $parsed = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch {}
+    $got = $(if (Test-NetViewRoster $parsed) { 'ok' } else { 'bad' })
+    if ($got -eq $exp) { Write-Output "PASS  validator: $($f.Name) -> $got" } else { $fails++; Write-Output "FAIL  validator: $($f.Name) expected $exp got $got" }
+  }
+  Write-Output "netview self-test: $($total - $fails)/$total passed"; exit $fails
 }
 
 # ---------- run ----------

@@ -79,8 +79,9 @@ digibyte-cli -testnet=0 -chain=main getoracles false
 Observed on slot 29, 2026-10-01 to 2026-10-06: after the v9.26.6 upgrade the oracle
 auto-started on wallet unlock before the new per-round state existed, and its price
 thread never broadcast. For about five days the node's own `listoracle` said running and
-price-updating, heartbeats went out, and the network never received a price from the slot.
-The node's self-view cannot see this failure. Only a node you do not run can.
+price-updating, heartbeats went out, and the observing node never received a price from the slot (the
+local `listoracle` and the public roster at digibyte.io disagreed for the whole period). The
+node's self-view cannot see this failure; a node you do not run can see what yours cannot.
 
 1. After the oracle starts, wait fifteen minutes, then read a roster served by a node you do
    not run. digibyte.io publishes its node's view at `https://digibyte.io/api/getoracles`
@@ -88,14 +89,17 @@ The node's self-view cannot see this failure. Only a node you do not run can.
    observer's current-round sample, not network proof, and it is unauthenticated with no
    published rate limit: read it at monitor cadence, never from a feed.
 2. **Read `last_update`, not `status`.** `status` churns every 40-block round: three reads
-   within one hour on 2026-10-06 showed 13, 10 and 35 of 35 slots "reporting", all with fresh
-   heartbeats, and every one of those nodes was healthy; a 12-read sample on the slot-29 box the
-   same day sat at 11 to 16 of 35 for consecutive rounds, with slot 29 itself "reporting" in 7
-   of the 12 while signing normally. `last_update` is the last price the
-   observer received from your slot: on healthy slots it reads under about twelve minutes;
-   on a silent slot it reads hours or days while the heartbeat stays `fresh`.
+   of digibyte.io's roster within one hour on 2026-10-06 showed 13, 10 and 35 of 35 slots
+   "reporting", all 35 with fresh heartbeats, and no slot was found to be at fault in that
+   sample; a 12-read sample on the slot-29 box the same day sat at 11 to 16 of 35 for
+   consecutive rounds, with slot 29 itself "reporting" in 7 of the 12 while signing normally. `last_update` is the last price the
+   observer received from your slot: in the 35-of-35 read above every slot read between 45
+   seconds and 11 minutes; during slot 29's silence it read 0 for days while the heartbeat
+   stayed `fresh`. Those are the observations the thresholds rest on, not a general bound.
 3. The failure signature is therefore: heartbeat `fresh` **and** `last_update` older than an
-   hour, on three reads spanning at least fifteen minutes. One stale read is not a signal.
+   hour (or 0, which the RPC help describes as the timestamp of the last price and which read
+   0 throughout slot 29's silence), on three reads spanning at least fifteen minutes. One stale
+   read is not a signal.
 4. Corroborate before acting: read the roster again in fifteen minutes and check your own
    `listoracle`. If the signature holds, cycle the oracle: `stoporacle N`, then `startoracle N`
    (wallet unlocked). On slot 29 the observer showed a fresh `last_update` within two minutes

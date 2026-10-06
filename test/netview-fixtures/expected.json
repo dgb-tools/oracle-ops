@@ -1,0 +1,13 @@
+{
+ "valid-35.json": "ok",
+ "dup-36-rows-35-unique.json": "bad",
+ "missing-last_update.json": "bad",
+ "null-last_update.json": "bad",
+ "fractional-id.json": "bad",
+ "string-id.json": "bad",
+ "34-unique.json": "bad",
+ "not-an-array.json": "bad",
+ "status-not-string.json": "bad",
+ "string-last_update.json": "bad",
+ "sentinel-zero-29.json": "ok"
+}
