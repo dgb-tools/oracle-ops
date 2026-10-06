@@ -231,7 +231,7 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
     # all normal), so status is NOT the signal: a fresh heartbeat with a stale last_update is.
     # Miss = successful read AND heartbeat fresh AND last_update older than NETVIEW_STALE_SECONDS.
     # Alert after 3 consecutive misses spanning >= 15 min. Fetch failure / non-JSON / roster without
-    # 35 unique ids = unknown: logged, streak reset, never a miss.
+    # 35 unique ids = unknown: never a miss; streak held while the last good read is < 30 min old, else reset.
     if [ "$ismainnet" = "1" ]; then
       local nraw nme nstat nsrc nhb nlu nage nmiss nsince nids netfail=0
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
@@ -248,15 +248,18 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
         elif [ "$nhb" = "fresh" ] && { [ "$nage" -lt 0 ] || [ "$nage" -gt "$NETVIEW_STALE_SECONDS" ]; }; then ismiss=1; fi
         nmiss=$(state_get net-miss 0); nsince=$(state_get net-miss-since "$NOW")
         if [ "$ismiss" = "1" ]; then [ "$nmiss" = "0" ] && nsince=$NOW; nmiss=$((nmiss + 1)); else nmiss=0; nsince=$NOW; fi
-        state_set net-miss "$nmiss"; state_set net-miss-since "$nsince"
+        state_set net-miss "$nmiss"; state_set net-miss-since "$nsince"; state_set net-last-ok-read "$NOW"
         [ "$nmiss" -ge 3 ] && [ $((NOW - nsince)) -ge 900 ] && netfail=1
         local netok=1; [ "$netfail" = "1" ] && netok=0
         report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
           "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${nage}s (heartbeat $nhb, status $nstat, price_source $nsrc) across $nmiss consecutive reads over $(( (NOW - nsince) / 60 )) minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
         summary="$summary net-o$ORACLE_ID=$nstat/lu${nage}s"
       else
-        state_set net-miss 0
-        log "netview check unknown (streak reset, not a miss): empty, non-JSON, or roster without 35 unique ids from $NETVIEW_URL"
+        # Unknown read: never a miss. Streak HELD while the last good read is under 30 min old (a flaky
+        # endpoint cannot erase evidence); RESET once no good read for 30 min (a stuck counter cannot page).
+        local lastok; lastok=$(state_get net-last-ok-read 0)
+        if [ $((NOW - lastok)) -gt 1800 ]; then state_set net-miss 0; log "netview check unknown; no good read for 30 min, streak reset ($NETVIEW_URL)"
+        else log "netview check unknown; streak held ($NETVIEW_URL)"; fi
       fi
     fi
   else

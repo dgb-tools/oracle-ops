@@ -222,7 +222,8 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     # observer received from us): healthy slots read under ~12 minutes; a silent slot reads hours or days.
     # A miss = successful read AND heartbeat fresh AND last_update older than NetViewStaleSeconds.
     # Alert after 3 consecutive misses spanning at least 15 minutes. A fetch failure, non-JSON body or an
-    # incomplete roster (not 35 unique ids) is "unknown": logged, streak reset, never a miss.
+    # incomplete roster (not 35 unique ids) is "unknown": never a miss; the streak is held while the last
+    # good read is under 30 minutes old and reset after that.
     if ($IsMainnet) {
       try {
         $raw = Invoke-WebRequest -Uri $NetViewUrl -UseBasicParsing -TimeoutSec 20 `
@@ -239,7 +240,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
         if ($State.ContainsKey('net-miss')) { $streak = [int]$State['net-miss'] }
         if ($State.ContainsKey('net-miss-since')) { $since = [int64]$State['net-miss-since'] }
         if ($miss) { if ($streak -eq 0) { $since = $nowU }; $streak = $streak + 1 } else { $streak = 0; $since = $nowU }
-        $State['net-miss'] = $streak; $State['net-miss-since'] = $since
+        $State['net-miss'] = $streak; $State['net-miss-since'] = $since; $State['net-last-ok-read'] = $nowU
         $netFail = ($streak -ge 3) -and (($nowU - $since) -ge 900)
         $nstat = 'absent'; $nsrc = 'n/a'; $nhb = 'n/a'
         if ($nme) { $nstat = $nme.status; $nsrc = $nme.price_source; $nhb = $nme.heartbeat_status }
@@ -251,7 +252,15 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
            "read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, " +
            "the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix.") 'urgent'
         $summary += " net-o$OracleId=$nstat/lu${luAge}s"
-      } catch { $State['net-miss'] = 0; Log "netview check unknown (streak reset, not a miss): $($_.Exception.Message)" }
+      } catch {
+        # Unknown read: never a miss. The streak is HELD while the last good read is recent (so a flaky
+        # endpoint cannot erase accumulating evidence) and RESET once no good read has happened for 30
+        # minutes (so a stuck counter cannot page on stale evidence). Review ruling, 2026-10-06.
+        $nowU2 = [int64][double]::Parse((Get-Date -UFormat %s)); $lastOk = 0
+        if ($State.ContainsKey('net-last-ok-read')) { $lastOk = [int64]$State['net-last-ok-read'] }
+        if (($nowU2 - $lastOk) -gt 1800) { $State['net-miss'] = 0; Log "netview check unknown; no good read for 30 min, streak reset: $($_.Exception.Message)" }
+        else { Log "netview check unknown; streak held: $($_.Exception.Message)" }
+      }
     }
   } else {
     $summary += "$Label-o$OracleId=staged(pre-activation)"
