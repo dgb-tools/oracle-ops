@@ -74,6 +74,40 @@ digibyte-cli -testnet=0 -chain=main getoracles false
   community to notice. On testnet, 19 of 35 slots sat dark for days-to-weeks at one
   point — nobody was told.
 
+## After any restart or upgrade: confirm your slot from OUTSIDE your node (v9.26.6)
+
+Observed on slot 29, 2026-10-01 to 2026-10-06: after the v9.26.6 upgrade the oracle
+auto-started on wallet unlock before the new per-round state existed, and its price
+thread never broadcast. For about five days the node's own `listoracle` said running and
+price-updating, heartbeats went out, and the network never received a price from the slot.
+The node's self-view cannot see this failure.
+
+1. After the oracle starts, wait fifteen minutes, then read the public roster that
+   digibyte.io serves from its own node:
+   `https://digibyte.io/api/getoracles` (same shape as a local `getoracles`; one entry per
+   slot with `status`, `heartbeat_status`, `price_source`, `last_update`).
+2. Your slot should show `status: reporting` with a recent `last_update`. If it shows
+   `no_data` for fifteen minutes or more while `heartbeat_status` is `fresh`, cycle the
+   oracle: `stoporacle N`, then `startoracle N` (wallet unlocked). On slot 29 the roster
+   showed reporting within two minutes and the next signed bundle included the slot four
+   minutes later.
+3. Do not read a single `no_data` as failure. Each node's view of `no_data` slots changes
+   every round (40 blocks): one read showed 13 reporting and 22 `no_data`, the next a
+   different set. Require three consecutive non-reporting reads, about fifteen minutes.
+
+Two v9.26.6 behaviors that look alarming and are not:
+
+- `Oracle: Manually cleared all pending messages and attestations` in `debug.log` every one
+  or two blocks on every node. It is the per-round pending-state reset.
+- A "reporting" count that churns from read to read (9, then 35, then 17 within minutes on
+  one node). It is a per-round sample, not a network health number. Heartbeats are the
+  stable availability signal; price feeds are per round.
+
+The monitors in this kit still check only the node's own view. Slot 29's monitor now also
+polls the digibyte.io roster for its slot each cycle and pages after three consecutive
+non-reporting reads, with fetch failures counted as unknown rather than as misses. That
+check is being brought into this kit; until then, do step 1 by hand after every restart.
+
 ## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
 
 Total slot-29 downtime for a two-chain upgrade on our box: **~25 minutes**, zero
@@ -167,6 +201,12 @@ most slots spent the incident. Two settings fix it, and both are non-defaults:
 
 The kit's `monitor/install-node-task.ps1` registers a task with both settings;
 `linux/systemd/digibyted.service` is the same protection via `Restart=always`.
+
+A third trap, for anyone editing the PowerShell scripts: variable names are case-insensitive,
+so a local `$net` inside a function that declares a `[string[]]$Net` parameter is the same
+variable, and every assignment to it is coerced to strings. Name locals distinctly from every
+parameter, ignoring case. (Found on slot 29, 2026-10-06: a roster of 35 objects became 35
+strings and every oracle id read as absent.)
 
 ### Post-crash triage: one incident, not two
 
