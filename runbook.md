@@ -289,14 +289,17 @@ cause unconfirmed.** Three levels of evidence, kept separate:
 - **Strongly implicated trigger.** All four recorded stalls followed our own
   `getblockchaininfo` request on that node. On 2026-10-01, `getblockcount` and
   `getdigidollarstats` had answered seconds earlier.
-- **Inferred mechanism, not directly measured.** `getblockchaininfo` holds the main chain lock
-  (`cs_main`) for its whole body. On a prune-mode node it computes `pruneheight` by walking the
-  block index backward from the tip to the first block whose data is gone
-  (`GetFirstStoredBlock`), potentially millions of entries on this node. The daemon had 7.0 GB
-  of private memory against a 2.2 GB working set, which is consistent with substantial paging;
-  index residency was not measured, and no thread stacks were captured during a stall. The
-  walk under `cs_main`, potentially aggravated by paging, is the leading explanation. v9.26.6 does not
-  change that code path.
+- **Mechanism, now identified by Core (2026-10-06).** The v9.26.7 release notes say
+  `getblockchaininfo` and `getchainstates` previously computed the scalar `difficulty` with a
+  default that "could walk far back through retired Groestl history while holding the main
+  chain lock, delaying other requests", and that v9.26.7 reads the difficulty directly from
+  the tip block. The change is four lines in `src/rpc/blockchain.cpp`
+  (`GetDifficulty(&tip, nullptr)` becomes a call that passes the tip's own algorithm). That
+  matches every observation here: the call that stalled, the whole node stalling with it
+  (the lock), and the oracle box's eight-minute case on an unpruned node. Our earlier guess
+  of a prune-height walk was wrong, and prune mode is not a factor; memory pressure may still
+  have made the walk slower on this box, which remains unmeasured. v9.26.7 contains the fix
+  and no consensus change.
 
 What follows from the observation alone:
 
