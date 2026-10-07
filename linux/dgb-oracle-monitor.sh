@@ -80,6 +80,21 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
 NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
+# Fork-detector state machine (pure except for state files). Oct 2026 lesson: a testnet node sat on a dead
+# branch for weeks while "headers == blocks" looked synced. If our HEADERS trail the highest height any
+# connected peer advertises (startingheight at connect, a lower bound on the real chain; or synced_headers)
+# by more than $5 blocks for 3 consecutive cycles, we are REJECTING their chain, not lagging it. Unknown
+# (no peer data) resets pending evidence and never fires. Known limit: dead-branch peers only -> no trip;
+# the network-view check is the backstop. args: key readok peermax ourheaders gap -> FK_FIRE FK_BEHIND FK_STREAK
+fork_update() {
+  local key="$1" readok="$2" peermax="$3" ours="$4" gap="$5" m
+  m=$(state_get "$key" 0); FK_FIRE=0; FK_BEHIND=0; FK_STREAK=0
+  if [ "$readok" != "1" ]; then state_set "$key" 0; return 0; fi
+  FK_BEHIND=$((peermax - ours))
+  if [ "$FK_BEHIND" -gt "$gap" ]; then m=$((m + 1)); else m=0; fi
+  state_set "$key" "$m"; FK_STREAK=$m; [ "$m" -ge 3 ] && FK_FIRE=1; return 0
+}
+
 # Roster validator (pure). "ok" only when: JSON array; row count == unique oracle_id count == 35 (a deliberate
 # compatibility restriction to the current mainnet roster size, not proof of completeness); every row is an object
 # with an integer oracle_id, string status, string heartbeat_status, and an explicitly present integer last_update
@@ -214,6 +229,20 @@ No systemd service configured - log in and start the daemon, or install digibyte
   report_check "$label-sync" "$synced" "DGB oracle box: $label node NOT SYNCED" \
     "blocks=$blocks headers=$headers ibd=$ibd tip_age_sec=$tipage" high
   summary="$label h=$blocks"
+  # FORK DETECTOR: local data only (getpeerinfo). See fork_update for the rule and its known limit.
+  local peers peermax peersok=0
+  peers=$($clifn getpeerinfo 2>/dev/null || true)
+  peermax=$(jq -r 'if type=="array" and length>0 then [.[] | (.startingheight // 0), (.synced_headers // 0)] | max else "none" end' <<< "$peers" 2>/dev/null || echo none)
+  [ "$peermax" != "none" ] && [ "$peermax" != "null" ] && peersok=1
+  fork_update "$label-fork-miss" "$peersok" "${peermax:-0}" "$headers" 100
+  if [ "$peersok" = "1" ]; then
+    local forkok=1; [ "$FK_FIRE" = "1" ] && forkok=0
+    report_check "$label-fork" "$forkok" "DGB oracle box: $label node may be on a DEAD BRANCH" \
+      "Our headers=$headers but connected peers advertise up to $peermax ($FK_BEHIND blocks ahead) for $FK_STREAK consecutive checks. A node that will not accept peers' headers is rejecting their chain (stored invalid marks, e.g. after crossing an activation on old software). Check: digibyte-cli getchaintips and look for status=invalid tips; compare getblockhash <h> with a second node; fix: reconsiderblock <hash>. Tip-age thresholds hide this; the peer-height comparison is the real check." urgent
+    [ "$FK_BEHIND" -gt 100 ] && summary="$summary PEERS_AHEAD_BY=$FK_BEHIND"
+  else
+    log "fork detector unknown (no peer data; pending evidence reset)"
+  fi
 
   local wallets wloaded=0
   wallets=$($clifn listwallets)
@@ -340,6 +369,14 @@ if [ "${1:-}" = "--netview-selftest" ]; then
     exp=$(jq -r --arg n "$n" '.[$n]' "$fxdir/expected.json"); got=$(netview_validate "$(cat "$f")"); total=$((total + 1))
     if [ "$got" = "$exp" ]; then echo "PASS  validator: $n -> $got"; else fails=$((fails + 1)); echo "FAIL  validator: $n expected $exp got $got"; fi
   done
+  # fork detector transitions: steps "readok:peermax:ours:expect"
+  run_fork() { local name="$1"; shift; local ok=1 trace=""; rm -f "$STATE"/x-fork-miss; total=$((total + 1))
+    for step in "$@"; do IFS=: read -r ro pm ou exp <<< "$step"; fork_update x-fork-miss "$ro" "$pm" "$ou" 100; trace="$trace fire=$FK_FIRE streak=$FK_STREAK |"; [ "$FK_FIRE" = "$exp" ] || ok=0; done
+    if [ "$ok" = "1" ]; then echo "PASS  $name"; else fails=$((fails + 1)); echo "FAIL  $name:$trace"; fi; }
+  run_fork "fork: peers 50 ahead for 5 cycles never fires" 1:1050:1000:0 1:1050:1000:0 1:1050:1000:0 1:1050:1000:0 1:1050:1000:0
+  run_fork "fork: peers 500 ahead fires on the 3rd cycle" 1:1500:1000:0 1:1500:1000:0 1:1500:1000:1
+  run_fork "fork: catching up clears the streak" 1:1500:1000:0 1:1500:1000:0 1:1500:1450:0 1:1500:1000:0 1:1500:1000:0
+  run_fork "fork: no peer data resets pending evidence and never fires" 1:1500:1000:0 1:1500:1000:0 0:0:1000:0 1:1500:1000:0 1:1500:1000:0 1:1500:1000:1
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 

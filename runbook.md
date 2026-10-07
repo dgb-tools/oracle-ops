@@ -121,6 +121,30 @@ fetch, a non-JSON body or an incomplete roster is never a miss and can never fir
 alert: pending evidence is reset and any active alert is left standing until a good read. The alert
 asks you to corroborate; it does not tell you to cycle on the first read.
 
+## "headers == blocks" is not "synced" when peers are far ahead (testnet fork, Sep–Oct 2026)
+
+The oracle box's testnet node sat on a dead branch from 2026-09-20 to 2026-10-07 while every
+metric the kit watched said synced: `headers` equaled `blocks`, the tip aged slowly, and two
+tip-age threshold raises (Aug 17, Oct 6) quietly tuned the symptom out. What it was doing was
+rejecting the real chain: it had marked the real block 432,386 (Thaw Day + 286 on testnet26)
+invalid, so every later header its peers announced was refused, and `synced_headers` for all
+30 peers stuck at 437,232 while their `startingheight` read 451,725. A second v9.26.5 node on
+the Tools VPS accepted the same block and followed the real chain, so software version alone
+is not the explanation. The cause of the original invalidity mark is not recoverable: the log
+had rotated. Block 432,386 contained three DigiDollar transactions, two with 226 inputs each,
+which is a candidate for a validation-state divergence and nothing more.
+
+- **The real check is the peer-height comparison**, not tip age: if the highest height your
+  connected peers advertise (`startingheight` at connect, or `synced_headers`) is more than
+  100 blocks above *your headers* for three cycles, your node is refusing their chain. Both
+  kit monitors now run this check from local `getpeerinfo` only.
+- **Fix:** `getchaintips`, find tips with `status: invalid`, compare `getblockhash <h>` with
+  a second node you trust, then `reconsiderblock <hash>` on the real chain's block. The reorg
+  follows within minutes. On the oracle box: headers went 437,233 to 451,739 within 90 s.
+- **Known limit:** a node whose peers are all on the same dead branch will not trip this
+  check. The network-view check above is the backstop.
+- Testnet oracles on a dead branch keep heartbeating; heartbeats do not need blocks.
+
 ## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
 
 Total slot-29 downtime for a two-chain upgrade on our box: **~25 minutes**, zero

@@ -125,6 +125,21 @@ function Get-CrashClass([string]$ChainLabel) {
 }
 
 # ---------- per-chain checks ----------
+# Fork-detector state machine (pure; no I/O). Oct 2026 lesson: a testnet node sat on a dead branch for weeks
+# while "headers == blocks" looked synced. If our HEADERS trail the highest height any connected peer advertises
+# (startingheight at connect, a valid lower bound on the real chain; or synced_headers for the fresh case) by
+# more than $Gap blocks for 3 consecutive cycles, we are REJECTING their chain, not lagging it. Unknown (no peer
+# data) resets pending evidence and never fires. Known limit: a dead-branch node whose peers are all on the same
+# dead branch will not trip this; the network-view check is the backstop.
+function Update-ForkState([hashtable]$St, [string]$Key, [bool]$ReadOk, [int64]$PeerMax, [int64]$OurHeaders, [int]$Gap = 100) {
+  $m = 0; if ($St.ContainsKey($Key)) { $m = [int]$St[$Key] }
+  if (-not $ReadOk) { $St[$Key] = 0; return @{ fire = $false; behind = 0; streak = 0; unknown = $true } }
+  $behind = $PeerMax - $OurHeaders
+  if ($behind -gt $Gap) { $m = $m + 1 } else { $m = 0 }
+  $St[$Key] = $m
+  return @{ fire = ($m -ge 3); behind = $behind; streak = $m; unknown = $false }
+}
+
 # Roster validator (pure). Equivalent to the bash netview_validate: $true only when the parsed body is an array of
 # exactly 35 objects whose oracle_id values are 35 unique integers, each with a string status, a string
 # heartbeat_status, and an explicitly present integer last_update >= 0 (0 is the never-received sentinel; null or
@@ -217,6 +232,18 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
   Report-Check "$Label-sync" $synced "DGB oracle box: $Label node NOT SYNCED" `
     "blocks=$($bc.blocks) headers=$($bc.headers) ibd=$($bc.initialblockdownload) tip_age_sec=$tipAge" 'high'
   $summary += "$Label h=$($bc.blocks)"
+  # FORK DETECTOR: local data only (getpeerinfo). See Update-ForkState for the rule and its known limit.
+  $peers = Get-DgbJson $Net @('getpeerinfo'); $peerMax = [int64]0; $peersOk = $false
+  if ($peers) { $peersOk = $true; foreach ($pp in @($peers)) { foreach ($v in @($pp.startingheight, $pp.synced_headers)) { if ($v -and ([int64]$v -gt $peerMax)) { $peerMax = [int64]$v } } } }
+  $fr = Update-ForkState $State "$Label-fork-miss" $peersOk $peerMax ([int64]$bc.headers) 100
+  if ($peersOk) {
+    Report-Check "$Label-fork" (-not $fr.fire) "DGB oracle box: $Label node may be on a DEAD BRANCH" `
+      ("Our headers=$($bc.headers) but connected peers advertise up to $peerMax ($($fr.behind) blocks ahead) for $($fr.streak) consecutive checks. " +
+       "A node that will not accept peers' headers is rejecting their chain (stored invalid marks, e.g. after crossing an activation on old software). " +
+       "Check: digibyte-cli $($Net -join ' ') getchaintips and look for status=invalid tips; compare getblockhash <h> with a second node; fix: reconsiderblock <hash>. " +
+       "Tip-age thresholds hide this; the peer-height comparison is the real check.") 'urgent'
+    if ($fr.behind -gt 100) { $summary += " $Label PEERS_AHEAD_BY=$($fr.behind)" }
+  } else { Log "fork detector unknown (no peer data; pending evidence reset)" }
 
   $wallets = Get-DgbJson $Net @('listwallets')
   $wLoaded = $wallets -contains $Cfg.oracle_wallet
@@ -354,6 +381,18 @@ if ($NetViewSelfTest) {
     $total++; $exp = $expected.($f.Name); $parsed = $null; try { $parsed = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch {}
     $got = $(if (Test-NetViewRoster $parsed) { 'ok' } else { 'bad' })
     if ($got -eq $exp) { Write-Output "PASS  validator: $($f.Name) -> $got" } else { $fails++; Write-Output "FAIL  validator: $($f.Name) expected $exp got $got" }
+  }
+  # fork detector transitions
+  $fcases = @(
+    @{ name = 'fork: peers 50 ahead for 5 cycles never fires'; steps = @(@($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false)) },
+    @{ name = 'fork: peers 500 ahead fires on the 3rd cycle'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$true)) },
+    @{ name = 'fork: catching up clears the streak'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1450,$false), @($true,1500,1000,$false), @($true,1500,1000,$false)) },
+    @{ name = 'fork: no peer data resets pending evidence and never fires'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($false,0,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$true)) }
+  )
+  foreach ($c in $fcases) {
+    $st = @{}; $ok = $true; $trace = @(); $total++
+    foreach ($s in $c.steps) { $r = Update-ForkState $st 'x-fork-miss' ([bool]$s[0]) ([int64]$s[1]) ([int64]$s[2]) 100; $trace += "fire=$($r.fire) streak=$($r.streak)"; if ($r.fire -ne [bool]$s[3]) { $ok = $false } }
+    if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
   }
   Write-Output "netview self-test: $($total - $fails)/$total passed"; exit $fails
 }
