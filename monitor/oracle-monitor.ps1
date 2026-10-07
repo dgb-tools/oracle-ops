@@ -25,6 +25,12 @@ $NetViewUrl = 'https://digibyte.io/api/getoracles'
 $NetViewStaleSeconds = 3600   # last_update older than this, with a fresh heartbeat, is a miss (healthy slots read minutes)
 $NetViewRosterStaleMax = 50   # percent; if this many slots or more read stale too, it is a network round stall, not our silence
 if ($Cfg.PSObject.Properties['network_view_roster_stale_max'] -and $Cfg.network_view_roster_stale_max) { $NetViewRosterStaleMax = [int]$Cfg.network_view_roster_stale_max }
+$ForkGapBlocks = 100          # a peer "claims ahead" when its startingheight exceeds our headers by more than this (triage threshold)
+$ForkMinPeers = 2             # this many peers must claim ahead at once; one erroneous peer cannot set the maximum
+$ForkProgressBlocks = 100     # headers advancing by at least this per cycle is a catch-up, not a stall
+if ($Cfg.PSObject.Properties['fork_gap_blocks'] -and $Cfg.fork_gap_blocks) { $ForkGapBlocks = [int]$Cfg.fork_gap_blocks }
+if ($Cfg.PSObject.Properties['fork_min_peers'] -and $Cfg.fork_min_peers) { $ForkMinPeers = [int]$Cfg.fork_min_peers }
+if ($Cfg.PSObject.Properties['fork_progress_blocks'] -and $Cfg.fork_progress_blocks) { $ForkProgressBlocks = [int]$Cfg.fork_progress_blocks }
 if ($Cfg.PSObject.Properties['network_view_stale_seconds'] -and $Cfg.network_view_stale_seconds) { $NetViewStaleSeconds = [int]$Cfg.network_view_stale_seconds }
 if ($Cfg.PSObject.Properties['network_view_url'] -and $Cfg.network_view_url) { $NetViewUrl = [string]$Cfg.network_view_url }
 $TestArgs = @('-testnet')
@@ -127,19 +133,54 @@ function Get-CrashClass([string]$ChainLabel) {
 }
 
 # ---------- per-chain checks ----------
-# Fork-detector state machine (pure; no I/O). Oct 2026 lesson: a testnet node sat on a dead branch for weeks
-# while "headers == blocks" looked synced. If our HEADERS trail the highest height any connected peer advertises
-# (startingheight at connect, a valid lower bound on the real chain; or synced_headers for the fresh case) by
-# more than $Gap blocks for 3 consecutive cycles, we are REJECTING their chain, not lagging it. Unknown (no peer
-# data) resets pending evidence and never fires. Known limit: a dead-branch node whose peers are all on the same
-# dead branch will not trip this; the network-view check is the backstop.
-function Update-ForkState([hashtable]$St, [string]$Key, [bool]$ReadOk, [int64]$PeerMax, [int64]$OurHeaders, [int]$Gap = 100) {
+# Fork detector, crew review 2026-10-07. Oct 2026 lesson: a testnet node sat on a dead branch for 17 days while
+# "headers == blocks" looked synced. The check compares our HEADERS with what connected peers CLAIM.
+# startingheight is a peer's claim at connect, not a lower bound on the valid chain, so one peer cannot set it:
+# $ForkMinPeers peers must each claim more than $ForkGapBlocks above our headers. synced_headers is not used: per
+# Core's help text it is "the last header we have in common with this peer", so it can never exceed ours.
+function Get-ForkPeersAhead($Peers, [int64]$Ours, [int]$Gap) {
+  $rows = @(); if ($null -ne $Peers) { $rows = @($Peers) }
+  if ($rows.Count -eq 0) { return @{ ok = $false; peers = 0; ahead = 0; claim = [int64]0 } }
+  $ahead = 0; $claim = [int64]0; $first = $true
+  foreach ($p in $rows) {
+    if ($null -eq $p -or -not ($p.PSObject.Properties['startingheight'])) { return @{ ok = $false; peers = 0; ahead = 0; claim = [int64]0 } }
+    $sh = [int64]$p.startingheight
+    if ($first -or ($sh -gt $claim)) { $claim = $sh; $first = $false }
+    if ($sh -gt ($Ours + $Gap)) { $ahead++ }
+  }
+  return @{ ok = $true; peers = $rows.Count; ahead = $ahead; claim = $claim }
+}
+# Update-ForkState (pure; no I/O). Outcomes:
+#  unknown = no peer data, or no previous headers sample to measure progress against: pending reset, alert untouched.
+#  ok      = fewer than MinPeers peers claim ahead: the ONLY outcome that clears an alert.
+#  catchup = enough peers claim ahead but our headers advanced >= ProgressBlocks since the previous cycle (a sync
+#            from behind moves far faster; a chain at 15 s blocks adds ~20 per 5-minute cycle, so a branch that
+#            merely keeps chain pace is not catching up): pending reset, alert untouched.
+#  stuck   = enough peers claim ahead and our headers did not advance: pending evidence; the 3rd consecutive FIRES.
+#  class on fire: deadbranch when the node looks synced locally (ibd=false and headers-blocks < 10), the pattern of
+#            the incident, urgent; stalledsync otherwise (still in IBD, or headers far ahead of blocks), normal
+#            priority, no reconsiderblock advice. Neither is a diagnosis: both say "investigate why local headers
+#            trail peer claims". Known limit, and the kit has NO backstop for it: peers all on the same dead branch
+#            never trip this; peers all claiming wrong heights would mis-trip it. A second node, an explorer, or
+#            getchaintips elsewhere is the backstop. The network-view check is not one: it reads the mainnet
+#            observer's price receipts, not chain agreement.
+function Update-ForkState([hashtable]$St, [string]$Key, [bool]$ReadOk, [int]$AheadN, $OurHeaders, [string]$Ibd, [int64]$Lag, [int]$MinPeers = 2, [int]$ProgressBlocks = 100) {
+  $res = @{ outcome = 'unknown'; fire = $false; class = ''; streak = 0; progress = [int64]0 }
   $m = 0; if ($St.ContainsKey($Key)) { $m = [int]$St[$Key] }
-  if (-not $ReadOk) { $St[$Key] = 0; return @{ fire = $false; behind = 0; streak = 0; unknown = $true } }
-  $behind = $PeerMax - $OurHeaders
-  if ($behind -gt $Gap) { $m = $m + 1 } else { $m = 0 }
-  $St[$Key] = $m
-  return @{ fire = ($m -ge 3); behind = $behind; streak = $m; unknown = $false }
+  $prev = $null; if ($St.ContainsKey("$Key-hdr") -and $null -ne $St["$Key-hdr"]) { $prev = [int64]$St["$Key-hdr"] }
+  if ($null -eq $OurHeaders) { $St[$Key] = 0; return $res }
+  $ours = [int64]$OurHeaders; $St["$Key-hdr"] = $ours
+  if (-not $ReadOk) { $St[$Key] = 0; return $res }
+  if ($AheadN -lt $MinPeers) { $res.outcome = 'ok'; $St[$Key] = 0; return $res }
+  if ($null -eq $prev) { $St[$Key] = 0; return $res }
+  $res.progress = $ours - $prev
+  if ($res.progress -ge $ProgressBlocks) { $res.outcome = 'catchup'; $St[$Key] = 0; return $res }
+  $res.outcome = 'stuck'; $m = $m + 1; $St[$Key] = $m; $res.streak = $m
+  if ($m -ge 3) {
+    $res.fire = $true
+    if (($Ibd -eq 'false') -and ($Lag -lt 10)) { $res.class = 'deadbranch' } else { $res.class = 'stalledsync' }
+  }
+  return $res
 }
 
 # Roster validator (pure). Equivalent to the bash netview_validate: $true only when the parsed body is an array of
@@ -237,18 +278,33 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
   Report-Check "$Label-sync" $synced "DGB oracle box: $Label node NOT SYNCED" `
     "blocks=$($bc.blocks) headers=$($bc.headers) ibd=$($bc.initialblockdownload) tip_age_sec=$tipAge" 'high'
   $summary += "$Label h=$($bc.blocks)"
-  # FORK DETECTOR: local data only (getpeerinfo). See Update-ForkState for the rule and its known limit.
-  $peers = Get-DgbJson $Net @('getpeerinfo'); $peerMax = [int64]0; $peersOk = $false
-  if ($peers) { $peersOk = $true; foreach ($pp in @($peers)) { foreach ($v in @($pp.startingheight, $pp.synced_headers)) { if ($v -and ([int64]$v -gt $peerMax)) { $peerMax = [int64]$v } } } }
-  $fr = Update-ForkState $State "$Label-fork-miss" $peersOk $peerMax ([int64]$bc.headers) 100
-  if ($peersOk) {
-    Report-Check "$Label-fork" (-not $fr.fire) "DGB oracle box: $Label node may be on a DEAD BRANCH" `
-      ("Our headers=$($bc.headers) but connected peers advertise up to $peerMax ($($fr.behind) blocks ahead) for $($fr.streak) consecutive checks. " +
-       "A node that will not accept peers' headers is rejecting their chain (stored invalid marks, e.g. after crossing an activation on old software). " +
-       "Check: digibyte-cli $($Net -join ' ') getchaintips and look for status=invalid tips; compare getblockhash <h> with a second node; fix: reconsiderblock <hash>. " +
-       "Tip-age thresholds hide this; the peer-height comparison is the real check.") 'urgent'
-    if ($fr.behind -gt 100) { $summary += " $Label PEERS_AHEAD_BY=$($fr.behind)" }
-  } else { Log "fork detector unknown (no peer data; pending evidence reset)" }
+  # FORK DETECTOR: local data only (getpeerinfo). See Update-ForkState for the outcomes and the known limit.
+  $peers = Get-DgbJson $Net @('getpeerinfo')
+  $pa = Get-ForkPeersAhead $peers ([int64]$bc.headers) $ForkGapBlocks
+  $ibdStr = "$($bc.initialblockdownload)".ToLower()
+  $fr = Update-ForkState $State "$Label-fork-miss" ([bool]$pa.ok) ([int]$pa.ahead) ([int64]$bc.headers) $ibdStr $lag $ForkMinPeers $ForkProgressBlocks
+  switch ($fr.outcome) {
+    'ok' { Report-Check "$Label-fork" $true "DGB oracle box: $Label headers trail peer claims" '' 'urgent' }
+    'stuck' {
+      $summary += " $Label PEERS_AHEAD=$($pa.ahead)/$($pa.peers)"
+      if (-not $fr.fire) {
+        Log "fork: stuck $($fr.streak)/3 ($($pa.ahead) of $($pa.peers) peers claim more than $ForkGapBlocks above headers=$($bc.headers), highest claim $($pa.claim); headers +$($fr.progress) this cycle); alert state untouched"
+      } elseif ($fr.class -eq 'deadbranch') {
+        Report-Check "$Label-fork" $false "DGB oracle box: $Label headers trail peer claims while the node looks synced (dead-branch candidate)" `
+          ("Our headers=$($bc.headers) advanced $($fr.progress) blocks since the previous check while $($pa.ahead) of $($pa.peers) connected peers claim a startingheight more than $ForkGapBlocks above them (highest claim $($pa.claim)), for $($fr.streak) consecutive checks, and this node reports ibd=false with headers within 10 of blocks: locally it looks synced. " +
+           "Local headers that trail peer claims and do not advance are consistent with a dead branch (a stored invalid mark, for example after crossing an activation on old software) and also with stale or wrong peer claims. " +
+           "Investigate why local headers trail peer claims before changing anything: digibyte-cli $($Net -join ' ') getchaintips; a tip with status=invalid above our height is the signal. " +
+           "Confirm with a node you trust or an explorer that the invalid tip's hash is on the real chain, and that this node's software is at the version the active rules require (otherwise it rejects the block again). Only then: reconsiderblock <hash>. " +
+           "On the oracle box on 2026-10-07 the reorg completed in about 90 s (one observation). Tip-age thresholds do not catch this.") 'urgent'
+      } else {
+        Report-Check "$Label-fork" $false "DGB oracle box: $Label headers trail peer claims and are not advancing (stalled sync)" `
+          ("Our headers=$($bc.headers) advanced $($fr.progress) blocks since the previous check while $($pa.ahead) of $($pa.peers) connected peers claim a startingheight more than $ForkGapBlocks above them (highest claim $($pa.claim)), for $($fr.streak) consecutive checks, and this node reports ibd=$ibdStr with headers-blocks=$($lag): it does not look synced locally. " +
+           "This is a stalled sync, not a dead-branch finding. Investigate why local headers trail peer claims (peer connectivity, disk, a sync that stopped). Do not run reconsiderblock on this evidence.") 'high'
+      }
+    }
+    'catchup' { Log "fork: $($pa.ahead) of $($pa.peers) peers claim more than $ForkGapBlocks above headers=$($bc.headers) but headers advanced +$($fr.progress) this cycle (catching up); pending evidence reset, alert state untouched" }
+    default { Log "fork detector unknown (no peer data, or no progress baseline yet); pending evidence reset, alert state untouched" }
+  }
 
   $wallets = Get-DgbJson $Net @('listwallets')
   $wLoaded = $wallets -contains $Cfg.oracle_wallet
@@ -394,16 +450,41 @@ if ($NetViewSelfTest) {
     $got = $(if (Test-NetViewRoster $parsed) { 'ok' } else { 'bad' })
     if ($got -eq $exp) { Write-Output "PASS  validator: $($f.Name) -> $got" } else { $fails++; Write-Output "FAIL  validator: $($f.Name) expected $exp got $got" }
   }
-  # fork detector transitions
+  # fork peer helper (pure): startingheight only, one peer cannot set the maximum
+  $pcases = @(
+    @{ name = 'fork peers: one peer far ahead, two at our height -> 1 of 3 ahead'; json = '[{"startingheight":1500},{"startingheight":1000},{"startingheight":1000}]'; exp = '1 3 1 1500' },
+    @{ name = 'fork peers: two peers 50 ahead -> none ahead (gap 100)'; json = '[{"startingheight":1050},{"startingheight":1050}]'; exp = '1 2 0 1050' },
+    @{ name = 'fork peers: two peers 500 ahead -> 2 of 3 ahead'; json = '[{"startingheight":1500},{"startingheight":1500},{"startingheight":900}]'; exp = '1 3 2 1500' },
+    @{ name = 'fork peers: synced_headers is ignored'; json = '[{"startingheight":1000,"synced_headers":9999},{"startingheight":1000,"synced_headers":9999}]'; exp = '1 2 0 1000' },
+    @{ name = 'fork peers: empty array is no data'; json = '[]'; exp = '0 0 0 0' },
+    @{ name = 'fork peers: non-JSON is no data'; json = 'garbage'; exp = '0 0 0 0' }
+  )
+  foreach ($c in $pcases) {
+    $total++; $parsed = $null; try { $parsed = $c.json | ConvertFrom-Json } catch { $parsed = $null }
+    $pa = Get-ForkPeersAhead $parsed ([int64]1000) 100
+    $got = "$(if ($pa.ok) { 1 } else { 0 }) $($pa.peers) $($pa.ahead) $($pa.claim)"
+    if ($got -eq $c.exp) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): expected [$($c.exp)] got [$got]" }
+  }
+  # fork detector transitions: steps (readok, ahead_n, ours, ibd, lag, expectOutcome, expectFire ('0'|'deadbranch'|'stalledsync'), expectAlertAfter)
   $fcases = @(
-    @{ name = 'fork: peers 50 ahead for 5 cycles never fires'; steps = @(@($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false), @($true,1050,1000,$false)) },
-    @{ name = 'fork: peers 500 ahead fires on the 3rd cycle'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$true)) },
-    @{ name = 'fork: catching up clears the streak'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1450,$false), @($true,1500,1000,$false), @($true,1500,1000,$false)) },
-    @{ name = 'fork: no peer data resets pending evidence and never fires'; steps = @(@($true,1500,1000,$false), @($true,1500,1000,$false), @($false,0,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$false), @($true,1500,1000,$true)) }
+    @{ name = 'fork: first read is unknown (no baseline); stuck x3 fires deadbranch when the node looks synced'; steps = @(@($true,2,1000,'false',0,'unknown','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','deadbranch',1)) },
+    @{ name = 'fork: one peer ahead is below the minimum: ok from the first read, never fires'; steps = @(@($true,1,1000,'false',0,'ok','0',0), @($true,1,1000,'false',0,'ok','0',0), @($true,1,1000,'false',0,'ok','0',0), @($true,1,1000,'false',0,'ok','0',0), @($true,1,1000,'false',0,'ok','0',0)) },
+    @{ name = 'fork: advancing catch-up never fires'; steps = @(@($true,2,1000,'true',0,'unknown','0',0), @($true,2,5000,'true',3000,'catchup','0',0), @($true,2,9000,'true',2000,'catchup','0',0), @($true,2,13000,'true',1000,'catchup','0',0), @($true,2,17000,'false',5,'catchup','0',0)) },
+    @{ name = 'fork: stuck in IBD fires stalledsync, not deadbranch'; steps = @(@($true,2,1000,'true',0,'unknown','0',0), @($true,2,1000,'true',0,'stuck','0',0), @($true,2,1000,'true',0,'stuck','0',0), @($true,2,1000,'true',0,'stuck','stalledsync',1)) },
+    @{ name = 'fork: headers far ahead of blocks fires stalledsync'; steps = @(@($true,2,1000,'false',500,'unknown','0',0), @($true,2,1000,'false',500,'stuck','0',0), @($true,2,1000,'false',500,'stuck','0',0), @($true,2,1000,'false',500,'stuck','stalledsync',1)) },
+    @{ name = 'fork: a catch-up read resets the streak; stuck counts again from 1'; steps = @(@($true,2,1000,'false',0,'unknown','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1450,'false',0,'catchup','0',0), @($true,2,1450,'false',0,'stuck','0',0), @($true,2,1450,'false',0,'stuck','0',0), @($true,2,1450,'false',0,'stuck','deadbranch',1)) },
+    @{ name = 'fork: an active alert survives unknown and the following stuck read (no false recovery); only ok clears'; steps = @(@($true,2,1000,'false',0,'unknown','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','deadbranch',1), @($false,0,1000,'false',0,'unknown','0',1), @($true,2,1000,'false',0,'stuck','0',1), @($true,2,1000,'false',0,'stuck','0',1), @($true,2,1000,'false',0,'stuck','deadbranch',1), @($true,0,1000,'false',0,'ok','0',0)) },
+    @{ name = 'fork: catch-up does not clear an active alert'; steps = @(@($true,2,1000,'false',0,'unknown','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','0',0), @($true,2,1000,'false',0,'stuck','deadbranch',1), @($true,2,1500,'false',0,'catchup','0',1), @($true,0,1500,'false',0,'ok','0',0)) }
   )
   foreach ($c in $fcases) {
-    $st = @{}; $ok = $true; $trace = @(); $total++
-    foreach ($s in $c.steps) { $r = Update-ForkState $st 'x-fork-miss' ([bool]$s[0]) ([int64]$s[1]) ([int64]$s[2]) 100; $trace += "fire=$($r.fire) streak=$($r.streak)"; if ($r.fire -ne [bool]$s[3]) { $ok = $false } }
+    $st = @{}; $ok = $true; $trace = @(); $alert = 0; $total++
+    foreach ($s in $c.steps) {
+      $r = Update-ForkState $st 'x-fork-miss' ([bool]$s[0]) ([int]$s[1]) ([int64]$s[2]) ([string]$s[3]) ([int64]$s[4]) 2 100
+      $fired = '0'; if ($r.fire) { $fired = $r.class }
+      if ($r.fire) { $alert = 1 } elseif ($r.outcome -eq 'ok') { $alert = 0 }   # caller wiring under test: only ok clears
+      $trace += "$($r.outcome)/$fired/a$alert"
+      if (($r.outcome -ne $s[5]) -or ($fired -ne $s[6]) -or ($alert -ne [int]$s[7])) { $ok = $false }
+    }
     if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
   }
   Write-Output "netview self-test: $($total - $fails)/$total passed"; exit $fails

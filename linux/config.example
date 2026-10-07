@@ -44,3 +44,7 @@ MIN_FREE_DISK_GB=15
 NETVIEW_URL="https://digibyte.io/api/getoracles"
 NETVIEW_STALE_SECONDS=3600
 NETVIEW_ROSTER_STALE_MAX=50   # percent of roster stale at which our staleness is a round stall, not our silence
+# Fork detector (local getpeerinfo only). Triage thresholds, not correctness boundaries:
+FORK_GAP_BLOCKS=100       # a peer "claims ahead" when its startingheight exceeds our headers by more than this
+FORK_MIN_PEERS=2          # this many peers must claim ahead at once (one erroneous peer cannot set the maximum)
+FORK_PROGRESS_BLOCKS=100  # headers advancing by at least this per cycle is a catch-up, not a stall

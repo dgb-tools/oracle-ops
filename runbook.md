@@ -122,8 +122,8 @@ clears. A 15-minute, 30-second-resolution sample of all 35 slots on the oracle b
 the roster's stale fraction swinging from 0% to 71% within minutes (median 34%); slot 29 read stale 16 of 30
 times, 8 of them during such stalls. A silent slot reads stale against a fresh roster for hours and still
 pages at fifteen minutes. Limitation: if the observing node itself is partitioned, the whole roster reads
-stale and this check goes quiet; the fork detector and the local checks are the backstop. Otherwise;
-the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
+stale and this check goes quiet; the local checks (sync flag, tip age) and a second node or an explorer
+are the backstop. Otherwise the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
 fetch, a non-JSON body or an incomplete roster is never a miss and can never fire or clear an
 alert: pending evidence is reset and any active alert is left standing until a good read. The alert
 asks you to corroborate; it does not tell you to cycle on the first read.
@@ -131,26 +131,50 @@ asks you to corroborate; it does not tell you to cycle on the first read.
 ## "headers == blocks" is not "synced" when peers are far ahead (testnet fork, Sep–Oct 2026)
 
 The oracle box's testnet node sat on a dead branch from 2026-09-20 to 2026-10-07 while every
-metric the kit watched said synced: `headers` equaled `blocks`, the tip aged slowly, and two
-tip-age threshold raises (Aug 17, Oct 6) quietly tuned the symptom out. What it was doing was
-rejecting the real chain: it had marked the real block 432,386 (Thaw Day + 286 on testnet26)
-invalid, so every later header its peers announced was refused, and `synced_headers` for all
-30 peers stuck at 437,232 while their `startingheight` read 451,725. A second v9.26.5 node on
-the Tools VPS accepted the same block and followed the real chain, so software version alone
-is not the explanation. The cause of the original invalidity mark is not recoverable: the log
-had rotated. Block 432,386 contained three DigiDollar transactions, two with 226 inputs each,
+metric the kit watched said synced: `headers` equaled `blocks` and the tip aged slowly. The
+tip-age threshold had been raised twice, on Aug 17 (before the incident) and on Oct 6 (during
+it); the Oct 6 raise tuned the remaining symptom out. What the node was doing was refusing the
+real chain: it had marked the real block 432,386 (Thaw Day + 286 on testnet26) invalid, so
+every later header its peers announced was rejected, and `synced_headers` for all 30 peers
+stuck at 437,232 while their `startingheight` read 451,725. A second v9.26.5 node on the Tools
+VPS accepted the same block and followed the real chain, so software version alone is not the
+explanation. The cause of the original invalidity mark is not recoverable: the log had
+rotated. Block 432,386 contained three DigiDollar transactions, two with 226 inputs each,
 which is a candidate for a validation-state divergence and nothing more.
 
-- **The real check is the peer-height comparison**, not tip age: if the highest height your
-  connected peers advertise (`startingheight` at connect, or `synced_headers`) is more than
-  100 blocks above *your headers* for three cycles, your node is refusing their chain. Both
-  kit monitors now run this check from local `getpeerinfo` only.
-- **Fix:** `getchaintips`, find tips with `status: invalid`, compare `getblockhash <h>` with
-  a second node you trust, then `reconsiderblock <hash>` on the real chain's block. The reorg
-  follows within minutes. On the oracle box: headers went 437,233 to 451,739 within 90 s.
-- **Known limit:** a node whose peers are all on the same dead branch will not trip this
-  check. The network-view check above is the backstop.
-- Testnet oracles on a dead branch keep heartbeating; heartbeats do not need blocks.
+- **What the kit checks** (both monitors, local `getpeerinfo` only): whether your *headers*
+  trail what connected peers *claim*. `startingheight` is a peer's claim at connect, not a
+  lower bound on the valid chain, so one peer cannot set it: at least two peers
+  (`fork_min_peers`) must claim more than 100 blocks (`fork_gap_blocks`) above your headers,
+  for three consecutive five-minute cycles, while your headers advance by fewer than 100
+  blocks per cycle (`fork_progress_blocks`). A normal sync from behind advances far faster
+  than that, and a chain at 15-second blocks adds about 20 per cycle, so a branch that merely
+  keeps pace does not count as catching up. The three numbers are triage thresholds, not
+  correctness boundaries. `synced_headers` is not used: per Core's help text it is "the last
+  header we have in common with this peer", so it can never exceed yours and cannot show a
+  dead branch.
+- **What the alert says** depends on what the node looks like locally. If it reports
+  `initialblockdownload=false` with headers within 10 of blocks, it looks synced, which is the
+  pattern of this incident; the alert is urgent and names a dead branch as a *candidate*.
+  Otherwise (still in initial block download, or headers far ahead of blocks) the alert is a
+  stalled sync at normal priority and gives no `reconsiderblock` advice. Either way the
+  instruction is the same: investigate why local headers trail peer claims. A node that is
+  catching up is not alerted on; a node with no peer data is unknown, which resets pending
+  evidence and never pages or clears.
+- **Only a within-gap read clears the alert.** Unknown, catch-up and pending reads leave an
+  active alert standing; a streak reset is not a recovery.
+- **Fix, conditional:** `getchaintips`; a tip with `status: invalid` at a height above yours is
+  the signal. Confirm with a node you trust, or an explorer, that the invalid tip's hash is on
+  the real chain, and confirm your software is at the version the active rules require,
+  otherwise the node rejects the block again. Only then `reconsiderblock <hash>`. On the
+  oracle box on 2026-10-07 the reorg from 437,233 to 451,739 completed in about 90 seconds;
+  that is one observation, not a rule.
+- **Known limit, and the kit has no backstop for it:** a node whose peers are all on the same
+  dead branch will not trip this check, and peers that all claim wrong heights would mis-trip
+  it. The backstop is outside the kit: a second node, an explorer, or `getchaintips` on a node
+  you trust. The network-view check is not a backstop here: it reads the mainnet observer's
+  price receipts, not chain agreement, and a testnet node on a dead branch keeps heartbeating,
+  since heartbeats do not need blocks.
 
 ## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
 
@@ -320,17 +344,18 @@ cause unconfirmed.** Three levels of evidence, kept separate:
 - **Strongly implicated trigger.** All four recorded stalls followed our own
   `getblockchaininfo` request on that node. On 2026-10-01, `getblockcount` and
   `getdigidollarstats` had answered seconds earlier.
-- **Mechanism, now identified by Core (2026-10-06).** The v9.26.7 release notes say
+- **Leading explanation (Core, 2026-10-06); attribution unconfirmed.** Core identified and
+  fixed a difficulty-history walk under `cs_main` in v9.26.7: the release notes say
   `getblockchaininfo` and `getchainstates` previously computed the scalar `difficulty` with a
   default that "could walk far back through retired Groestl history while holding the main
-  chain lock, delaying other requests", and that v9.26.7 reads the difficulty directly from
-  the tip block. The change is four lines in `src/rpc/blockchain.cpp`
-  (`GetDifficulty(&tip, nullptr)` becomes a call that passes the tip's own algorithm). That
-  matches every observation here: the call that stalled, the whole node stalling with it
-  (the lock), and the oracle box's eight-minute case on an unpruned node. Our earlier guess
-  of a prune-height walk was wrong, and prune mode is not a factor; memory pressure may still
-  have made the walk slower on this box, which remains unmeasured. v9.26.7 contains the fix
-  and no consensus change.
+  chain lock, delaying other requests", and v9.26.7 reads the difficulty directly from the
+  tip block. The change is four lines in `src/rpc/blockchain.cpp` (`GetDifficulty(&tip,
+  nullptr)` becomes a call that passes the tip's own algorithm). This is now the leading
+  explanation for our stalls, including the oracle box's unpruned eight-minute case. It does
+  not require prune mode. Our earlier prune-height explanation is superseded; attribution to
+  this incident remains unconfirmed without a trace or a controlled before/after measurement.
+  Whether memory pressure or pruning made the walk slower on this box is unmeasured. v9.26.7
+  contains the fix and no consensus change.
 
 What follows from the observation alone:
 
@@ -342,7 +367,7 @@ What follows from the observation alone:
   this node's `UpdateTip` log; use an independent explorer to measure network advancement
   and the node's lag.
 - `getdigidollarstats` is not free either: it paused block processing for about a minute in
-  the same timeline. Do not schedule heavy RPC calls against a small prune-mode node.
+  the same timeline. Do not schedule heavy RPC calls against a node that has shown this stall.
 - A client timeout does not cancel the call on the server. Repeated probes can pile up behind
   the one already running.
 - The oracle box (unpruned) showed a related effect in August: `getblockchaininfo` went
@@ -350,10 +375,12 @@ What follows from the observation alone:
 
 **Known issue in this kit's own monitor.** `oracle-monitor.ps1` and `dgb-oracle-monitor.sh` call
 `getblockchaininfo` on every run to read blocks, headers, tip time and the initial-sync flag. On
-an unpruned node with enough memory that has been cheap, and it is how slot 29 has run since
-July. On a small prune-mode node it could repeatedly trigger the stall above or accumulate
-waiting requests. Until the monitor's liveness check is changed, do not point it at a
-prune-mode node on a small box.
+any version before v9.26.7 that is the call Core's note identifies, issued every five minutes.
+On the oracle box (unpruned) the monitor has done this since July without a recorded stall of
+its own; on the anchor (8 GB, `prune=10000`, v9.26.5) our `getblockchaininfo` calls preceded
+all four recorded stalls. Whether box size or pruning changes the cost is unmeasured. Until the
+monitor's liveness check is changed, do not point it at a node that has shown this stall, and
+run v9.26.7 where you can.
 
 **`monitor/anchor-keeper.ps1` is withdrawn.** It would have mistaken this recoverable stall for
 a condition requiring termination. It was never installed. A bounded escalation path remains

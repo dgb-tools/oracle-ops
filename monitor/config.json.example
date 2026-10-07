@@ -18,5 +18,8 @@
   "min_free_disk_gb": 15,
   "network_view_url": "https://digibyte.io/api/getoracles",
   "network_view_stale_seconds": 3600,
-  "network_view_roster_stale_max": 50
+  "network_view_roster_stale_max": 50,
+  "fork_gap_blocks": 100,
+  "fork_min_peers": 2,
+  "fork_progress_blocks": 100
 }
