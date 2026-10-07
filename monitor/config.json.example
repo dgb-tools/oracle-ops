@@ -17,5 +17,6 @@
   "heartbeat_hour": 9,
   "min_free_disk_gb": 15,
   "network_view_url": "https://digibyte.io/api/getoracles",
-  "network_view_stale_seconds": 3600
+  "network_view_stale_seconds": 3600,
+  "network_view_roster_stale_max": 50
 }

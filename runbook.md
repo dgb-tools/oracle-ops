@@ -114,8 +114,15 @@ Two v9.26.6 behaviors that will show up and are not understood as failures:
   node). It is a per-round sample, not a network health number. Heartbeats are the stable
   availability signal; price receipts per slot are read from `last_update`.
 
-The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`
-in the config): a miss is a successful read with a fresh heartbeat and a stale `last_update`;
+The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`,
+`network_view_roster_stale_max` in the config): a miss is a successful read with a fresh heartbeat and
+a stale `last_update` *while the roster is mostly fresh*. If half or more of the roster reads stale at the
+same instant, that is a signing-round stall at the observer, not your silence, and it neither pages nor
+clears. A 15-minute, 30-second-resolution sample of all 35 slots on the oracle box on 2026-10-07 showed
+the roster's stale fraction swinging from 0% to 71% within minutes (median 34%); slot 29 read stale 16 of 30
+times, 8 of them during such stalls. A silent slot reads stale against a fresh roster for hours and still
+pages at fifteen minutes. Limitation: if the observing node itself is partitioned, the whole roster reads
+stale and this check goes quiet; the fork detector and the local checks are the backstop. Otherwise;
 the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
 fetch, a non-JSON body or an incomplete roster is never a miss and can never fire or clear an
 alert: pending evidence is reset and any active alert is left standing until a good read. The alert

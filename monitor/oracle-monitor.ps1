@@ -23,6 +23,8 @@ $OracleId = [int]$Cfg.oracle_id
 # Optional config key: network_view_url. Keep this at the monitor's cadence; the endpoint is unauthenticated.
 $NetViewUrl = 'https://digibyte.io/api/getoracles'
 $NetViewStaleSeconds = 3600   # last_update older than this, with a fresh heartbeat, is a miss (healthy slots read minutes)
+$NetViewRosterStaleMax = 50   # percent; if this many slots or more read stale too, it is a network round stall, not our silence
+if ($Cfg.PSObject.Properties['network_view_roster_stale_max'] -and $Cfg.network_view_roster_stale_max) { $NetViewRosterStaleMax = [int]$Cfg.network_view_roster_stale_max }
 if ($Cfg.PSObject.Properties['network_view_stale_seconds'] -and $Cfg.network_view_stale_seconds) { $NetViewStaleSeconds = [int]$Cfg.network_view_stale_seconds }
 if ($Cfg.PSObject.Properties['network_view_url'] -and $Cfg.network_view_url) { $NetViewUrl = [string]$Cfg.network_view_url }
 $TestArgs = @('-testnet')
@@ -168,10 +170,12 @@ function Test-NetViewRoster($Roster) {
 #               evidence; the only outcome allowed to clear an active alert.
 #  outofscope = read ok but heartbeat not fresh (node down/restarting/loading): nothing known about the price
 #               path. Pending evidence reset; alert untouched.
+#  roundstall = our slot reads stale but at least $RosterStaleMax percent of the roster reads stale too (a
+#               signing-round stall at the observer, not our silence). Pending evidence reset; alert untouched.
 #  unknown    = read not ok, or last_update malformed or in the future (> now + 300 s). Pending evidence reset;
 #               alert untouched. Never a miss, never a hit.
 #  fire       = a miss that is the 3rd+ consecutive AND >= 900 s after the first of the streak.
-function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU, [int]$StaleSeconds) {
+function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU, [int]$StaleSeconds, [int]$RosterStalePct = 0, [int]$RosterStaleMax = 50) {
   $streak = 0; $since = $NowU
   if ($St.ContainsKey('net-miss')) { $streak = [int]$St['net-miss'] }
   if ($St.ContainsKey('net-miss-since')) { $since = [int64]$St['net-miss-since'] }
@@ -185,6 +189,7 @@ function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU
   }
   if ($Entry.heartbeat_status -ne 'fresh') { $St['net-miss'] = 0; $res.outcome = 'outofscope'; $res.age = $age; return $res }
   $miss = ($age -lt 0) -or ($age -gt $StaleSeconds)
+  if ($miss -and ($RosterStalePct -ge $RosterStaleMax)) { $St['net-miss'] = 0; $res.outcome = 'roundstall'; $res.age = $age; return $res }
   if ($miss) { if ($streak -eq 0) { $since = $NowU }; $streak = $streak + 1 } else { $streak = 0; $since = $NowU }
   $St['net-miss'] = $streak; $St['net-miss-since'] = $since; $St['net-last-ok-read'] = $NowU
   $res.outcome = $(if ($miss) { 'miss' } else { 'hit' }); $res.streak = $streak; $res.age = $age
@@ -313,14 +318,16 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
         if (-not $nme) { throw "slot $OracleId absent; configuration or response completeness unconfirmed" }
         $readOk = $true
       } catch { $why = $_.Exception.Message }
-      $r = Update-NetViewState $State $readOk $nme $nowU $NetViewStaleSeconds
+      $rosterStalePct = 0
+      if ($readOk) { $staleRows = @($netRoster | Where-Object { ([int64]$_.last_update -eq 0) -or (($nowU - [int64]$_.last_update) -gt $NetViewStaleSeconds) }).Count; $rosterStalePct = [int][math]::Floor($staleRows * 100 / 35) }
+      $r = Update-NetViewState $State $readOk $nme $nowU $NetViewStaleSeconds $rosterStalePct $NetViewRosterStaleMax
       switch ($r.outcome) {
         'miss' {
           if ($r.fire) {
             $localStatus = 'missing'; if ($me) { $localStatus = $me.status }
             Report-Check "$Label-oracle$OracleId-networkview" $false "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" `
               ("The observer at $NetViewUrl has not received a price from slot $OracleId for $($r.age) seconds " +
-               "(heartbeat $($nme.heartbeat_status), status $($nme.status), price_source $($nme.price_source)) across $($r.streak) consecutive reads over $($r.minutes) minutes, " +
+               "(heartbeat $($nme.heartbeat_status), status $($nme.status), price_source $($nme.price_source)) across $($r.streak) consecutive reads over $($r.minutes) minutes (roster $rosterStalePct% stale at the last read), " +
                "while this node reports status=$localStatus. This is one observer's view, not network proof. Corroborate first: " +
                "read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, " +
                "the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix.") 'urgent'
@@ -329,6 +336,7 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
         }
         'hit' { Report-Check "$Label-oracle$OracleId-networkview" $true "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" 'confirmed recovery' 'urgent'; $summary += " net-o$OracleId=hit/lu$($r.age)s" }
         'outofscope' { $summary += " net-o$OracleId=hb-$($nme.heartbeat_status)"; Log "netview: heartbeat $($nme.heartbeat_status) at the observer; price path not assessed, alert state untouched" }
+        'roundstall' { $summary += " net-o$OracleId=roundstall/$rosterStalePct%"; Log "netview: our slot stale but $rosterStalePct% of the roster stale at the observer; signing-round stall, not our silence; alert state untouched" }
         default { Log "netview check unknown (pending evidence reset, alert state untouched): $(if ($why) { $why } else { 'last_update malformed or in the future' })" }
       }
     }
@@ -354,6 +362,9 @@ if ($NetViewSelfTest) {
     @{ name = 'active alert survives a stale heartbeat (restart does not count as recovery)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'stale',5200,1200,$false,1), @($true,'stale',5500,1500,$false,1)) },
     @{ name = 'malformed and future timestamps are unknown: never fire, never clear'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh','bad',1200,$false,1), @($true,'fresh','future',1500,$false,1)) },
     @{ name = 'last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh','soon',1200,$false,0)) },
+    @{ name = 'stale while the roster is mostly stale (round stall) never fires'; steps = @(@($true,'fresh',4000,0,$false,0,60), @($true,'fresh',4300,300,$false,0,71), @($true,'fresh',4600,600,$false,0,55), @($true,'fresh',4900,900,$false,0,50), @($true,'fresh',5200,1200,$false,0,64)) },
+    @{ name = 'stale while the roster is fresh fires; a round-stall read in the middle resets pending evidence'; steps = @(@($true,'fresh',4000,0,$false,0,3), @($true,'fresh',4300,300,$false,0,34), @($true,'fresh',4600,600,$false,0,60), @($true,'fresh',4900,900,$false,0,10), @($true,'fresh',5200,1200,$false,0,0), @($true,'fresh',5500,1500,$false,0,20), @($true,'fresh',5800,1800,$true,1,30)) },
+    @{ name = 'an active alert survives round-stall reads (unconfirmed, not recovered)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh',5200,1200,$false,1,70), @($true,'fresh',5500,1500,$false,1,55)) },
     @{ name = 'confirmed recovery clears the alert'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh',60,1200,$false,0)) }
   )
   $fails = 0; $t0 = 1800000000
@@ -366,7 +377,8 @@ if ($NetViewSelfTest) {
         switch ("$($s[2])") { 'zero' { $lu = 0 } 'none' { $lu = $null } 'future' { $lu = $t0 + $s[3] + 3600 } 'soon' { $lu = $t0 + $s[3] + 120 } 'bad' { $lu = '12abc' } default { $lu = $t0 + $s[3] - [int]$s[2] } }
         $entry = [pscustomobject]@{ heartbeat_status = $s[1]; last_update = $lu }
       }
-      $r = Update-NetViewState $st ([bool]$s[0]) $entry ([int64]($t0 + $s[3])) 3600
+      $rf = 0; if ($s.Count -ge 7) { $rf = [int]$s[6] }
+      $r = Update-NetViewState $st ([bool]$s[0]) $entry ([int64]($t0 + $s[3])) 3600 $rf 50
       if ($r.fire) { $alert = 1 } elseif ($r.outcome -eq 'hit') { $alert = 0 }   # caller wiring under test
       $trace += "t+$($s[3])s $($r.outcome) fire=$($r.fire) alert=$alert"
       if (($r.fire -ne [bool]$s[4]) -or ($alert -ne [int]$s[5])) { $ok = $false }

@@ -43,3 +43,4 @@ MIN_FREE_DISK_GB=15
 # A node you do not run, asked what it sees for your slot (keep at monitor cadence):
 NETVIEW_URL="https://digibyte.io/api/getoracles"
 NETVIEW_STALE_SECONDS=3600
+NETVIEW_ROSTER_STALE_MAX=50   # percent of roster stale at which our staleness is a round stall, not our silence

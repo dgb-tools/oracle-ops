@@ -80,6 +80,7 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
 NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
+NETVIEW_ROSTER_STALE_MAX="${NETVIEW_ROSTER_STALE_MAX:-50}"  # percent; if this many slots or more read stale too, it is a network round stall, not our silence
 # Fork-detector state machine (pure except for state files). Oct 2026 lesson: a testnet node sat on a dead
 # branch for weeks while "headers == blocks" looked synced. If our HEADERS trail the highest height any
 # connected peer advertises (startingheight at connect, a lower bound on the real chain; or synced_headers)
@@ -116,13 +117,15 @@ netview_validate() {
 #               pending evidence and is the only outcome that may clear an active alert.
 #  outofscope = read ok but heartbeat not fresh (node down, restarting, loading): says nothing about the
 #               price path. Pending evidence reset; alert state untouched.
+#  roundstall = our slot reads stale but at least NETVIEW_ROSTER_STALE_MAX percent of the roster reads stale
+#               too (a signing-round stall at the observer, not our silence): pending evidence reset, alert untouched.
 #  unknown    = read not ok, or last_update malformed or in the future (> now + 300 s): pending evidence
 #               reset; alert state untouched. Never a miss, never a hit.
 #  FIRE only on a miss that is the 3rd+ consecutive AND >= 900 s after the first of the streak.
-# args: readok(1|0) heartbeat_status last_update_raw now stale_seconds
+# args: readok(1|0) heartbeat_status last_update_raw now stale_seconds [roster_stale_percent]
 #  -> NV_OUTCOME NV_FIRE NV_STREAK NV_AGE NV_MINUTES
 netview_update() {
-  local readok="$1" hb="$2" lu="$3" now="$4" stale="$5" streak since
+  local readok="$1" hb="$2" lu="$3" now="$4" stale="$5" rfrac="${6:-0}" streak since
   streak=$(state_get net-miss 0); since=$(state_get net-miss-since "$now")
   NV_OUTCOME=unknown; NV_FIRE=0; NV_STREAK=0; NV_AGE=-1; NV_MINUTES=0
   if [ "$readok" != "1" ]; then state_set net-miss 0; return 0; fi
@@ -130,6 +133,7 @@ netview_update() {
   case "$lu" in 0) NV_AGE=-1 ;; ''|null|*[!0-9]*) state_set net-miss 0; return 0 ;; *) NV_AGE=$((now - lu)); if [ "$NV_AGE" -lt -300 ]; then state_set net-miss 0; return 0; fi; [ "$NV_AGE" -lt 0 ] && NV_AGE=0 ;; esac
   if [ "$hb" != "fresh" ]; then NV_OUTCOME=outofscope; state_set net-miss 0; return 0; fi
   if [ "$NV_AGE" -lt 0 ] || [ "$NV_AGE" -gt "$stale" ]; then NV_OUTCOME=miss; else NV_OUTCOME=hit; fi
+  if [ "$NV_OUTCOME" = "miss" ] && [ "$rfrac" -ge "${NETVIEW_ROSTER_STALE_MAX:-50}" ]; then NV_OUTCOME=roundstall; state_set net-miss 0; return 0; fi
   if [ "$NV_OUTCOME" = "miss" ]; then [ "$streak" = "0" ] && since=$now; streak=$((streak + 1)); else streak=0; since=$now; fi
   state_set net-miss "$streak"; state_set net-miss-since "$since"; state_set net-last-ok-read "$now"
   NV_STREAK=$streak; NV_MINUTES=$(( (now - since) / 60 ))
@@ -306,17 +310,21 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
       nvalid=$(netview_validate "$nraw")
       nme=""; [ "$nvalid" = "ok" ] && nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
-      if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme"); else nhb=""; nlu=""; fi
-      netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS"
+      local nrfrac=0
+      if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme")
+        nrfrac=$(jq -r --argjson now "$NOW" --argjson st "$NETVIEW_STALE_SECONDS" '[.[] | select(.last_update == 0 or ($now - .last_update) > $st)] | length * 100 / 35 | floor' <<< "$nraw" 2>/dev/null || echo 0)
+      else nhb=""; nlu=""; fi
+      netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS" "$nrfrac"
       case "$NV_OUTCOME" in
         miss|hit)
           local netok=1; [ "$NV_FIRE" = "1" ] && netok=0
           if [ "$NV_OUTCOME" = "hit" ] || [ "$NV_FIRE" = "1" ]; then   # a miss that is not yet firing makes no call, so an active alert stands
           report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
-            "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
+            "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes (roster ${nrfrac}% stale at the last read), while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
           fi
           summary="$summary net-o$ORACLE_ID=$NV_OUTCOME/lu${NV_AGE}s" ;;
         outofscope) summary="$summary net-o$ORACLE_ID=hb-$nhb"; log "netview: heartbeat $nhb at the observer; price path not assessed, alert state untouched" ;;
+        roundstall) summary="$summary net-o$ORACLE_ID=roundstall/${nrfrac}%"; log "netview: our slot stale but ${nrfrac}% of the roster stale at the observer; signing-round stall, not our silence; alert state untouched" ;;
         *) if [ "$nvalid" != "ok" ]; then log "netview check unknown (pending evidence reset, alert state untouched): roster failed schema/completeness check from $NETVIEW_URL"
            elif [ -z "$nme" ]; then log "netview check unknown: slot $ORACLE_ID absent; configuration or response completeness unconfirmed ($NETVIEW_URL)"
            else log "netview check unknown: last_update malformed or in the future for slot $ORACLE_ID (pending evidence reset, alert state untouched)"; fi ;;
@@ -340,9 +348,9 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case() { # name; then steps "readok:hb:age|none|future|bad:offset:expectFire:expectAlertAfter"
     local name="$1"; shift; local ok=1 trace="" alert=0; rm -f "$STATE"/net-*; total=$((total + 1))
     for step in "$@"; do
-      IFS=: read -r ro hb age off expf expa <<< "$step"; local lu=""
+      IFS=: read -r ro hb age off expf expa rf <<< "$step"; local lu=""; rf="${rf:-0}"
       case "$age" in zero) lu=0 ;; none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; soon) lu=$((t0 + off + 120)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
-      netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600
+      netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600 "$rf"
       # caller wiring under test: alert set only on fire; cleared only on hit; otherwise untouched
       if [ "$NV_FIRE" = "1" ]; then alert=1; elif [ "$NV_OUTCOME" = "hit" ]; then alert=0; fi
       trace="$trace t+${off}s $NV_OUTCOME fire=$NV_FIRE alert=$alert |"
@@ -362,6 +370,9 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case "active alert survives a stale heartbeat (restart does not count as recovery)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:stale:5200:1200:0:1 1:stale:5500:1500:0:1
   run_case "malformed and future timestamps are unknown: never fire, never clear" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:bad:1200:0:1 1:fresh:future:1500:0:1
   run_case "last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:soon:1200:0:0
+  run_case "stale while the roster is mostly stale (round stall) never fires" 1:fresh:4000:0:0:0:60 1:fresh:4300:300:0:0:71 1:fresh:4600:600:0:0:55 1:fresh:4900:900:0:0:50 1:fresh:5200:1200:0:0:64
+  run_case "stale while the roster is fresh fires; a round-stall read in the middle resets pending evidence" 1:fresh:4000:0:0:0:3 1:fresh:4300:300:0:0:34 1:fresh:4600:600:0:0:60 1:fresh:4900:900:0:0:10 1:fresh:5200:1200:0:0:0 1:fresh:5500:1500:0:0:20 1:fresh:5800:1800:1:1:30
+  run_case "an active alert survives round-stall reads (unconfirmed, not recovered)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:5200:1200:0:1:70 1:fresh:5500:1500:0:1:55
   run_case "confirmed recovery clears the alert" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:60:1200:0:0
   # validator against the shared fixtures
   fxdir="$(cd "$(dirname "$0")/.." && pwd)/test/netview-fixtures"
