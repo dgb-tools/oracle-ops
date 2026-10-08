@@ -176,11 +176,13 @@ which is a candidate for a validation-state divergence and nothing more.
   price receipts, not chain agreement, and a testnet node on a dead branch keeps heartbeating,
   since heartbeats do not need blocks.
 
-## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026)
+## Upgrading the node (proven: v9.26.4 → v9.26.5, July 24, 2026; v9.26.6 → v9.26.7, Oct 7–8, 2026)
 
-Total slot-29 downtime for a two-chain upgrade on our box: **~25 minutes**, zero
-rollback, zero re-validation. The entire trick is stopping cleanly BEFORE the
-installer runs — this supersedes reboot-and-revalidate as the maintenance path:
+Total slot-29 downtime for a two-chain upgrade on our box: **~25 minutes** of machine
+work, zero rollback, zero re-validation. The entire trick is stopping cleanly BEFORE the
+installer runs; this supersedes reboot-and-revalidate as the maintenance path. The other
+trick, learned the hard way on Oct 7, is not stopping until the next human step is certain
+(step 1b).
 
 ```
 # 1. Download the new installer and verify its hash BEFORE touching the node.
@@ -190,6 +192,22 @@ installer runs — this supersedes reboot-and-revalidate as the maintenance path
 #      cdbd6ed7efdb006b91b76389db79d2a3db2593f05e56dd789f394a1b4366c211  digibyte-9.26.6-x86_64-linux-gnu.tar.gz
 #    (v9.26.5 Windows asset, self-recorded because that release published none:
 #    SHA256 880CDD2CC3CABCC838AEA6045647D7FD4AC4CA95BE25FD808C939641386B9325)
+#    v9.26.7 (2026-10-06, /releases/latest; no consensus change, no reindex; carries the
+#    getblockchaininfo difficulty-walk fix described in the correction at the end):
+#      dc91563e439c8a9875a1e9ee576744d60afa60a983a1b84079afd450cfa71043  digibyte-9.26.7-win64-setup.exe
+#      85f1a587e7d45fc63ef65cbbd0e5fa56f6d94f2f5cd7657a8d02ba66638cd8d6  digibyte-9.26.7-x86_64-linux-gnu.tar.gz
+
+# 1b. DO NOT STOP ANYTHING until the operator confirms they are at the keyboard and will run
+#    the next step within the minute. Download, checksum, and the pre-upgrade baseline all
+#    happen before the stop; the stop itself takes minutes. On Oct 7, 2026 the oracle box was
+#    stopped and the installer line handed to an operator who was away; with auto-restart
+#    correctly disabled nothing relaunched, the network monitor listed slot 29 stale within
+#    the hour, and the wallet-unlock step waited another ~11 hours. Total slot outage about
+#    20 hours for about 20 minutes of machine work. Two rules follow:
+#      - A stop-and-wait handoff carries a ~15-minute timeout. If the next human step is not
+#        confirmed by then, relaunch the CURRENT version and redo the stop later.
+#      - An oracle outage is never worth a non-urgent release. A node without an oracle but
+#        with public services behind it (faucet, gateway, API) follows the same rule.
 
 # 2. PAUSE AUTO-RESTART FIRST. If you installed this kit's keeper task (5-minute repetition)
 #    or the systemd unit (Restart=always), it will relaunch the daemon minutes after a CLI
@@ -210,8 +228,9 @@ digibyte-cli -testnet stop
 #    finish and ask again. Do not kill it.
 
 # 4. WAIT for the clean flush, and confirm it. Observed shutdowns on our box: 2-4 minutes
-#    in July; about 7 minutes during October's upgrade after 35 days of uptime. These are
-#    observations, not guarantees. Budget 10. Confirm "Shutdown: done" in the log AND that
+#    in July; about 7 minutes during the v9.26.6 upgrade after 35 days of uptime; 130 s
+#    during the v9.26.7 upgrade after 6 days. Flush time tracks uptime and dbcache, not the
+#    version. These are observations, not guarantees. Budget 10. Confirm "Shutdown: done" in the log AND that
 #    the process has exited, for both chains, before installing. Never kill the process:
 #    that converts your clean upgrade into the hard-reboot scenario at the top of this
 #    runbook. Note the shipped systemd unit sets TimeoutStopSec=600: systemd itself will
@@ -224,8 +243,16 @@ digibyte-cli -testnet stop
 #                (Start-ScheduledTask -TaskName DigiByteOracleNode). The 5-minute trigger
 #                is a re-check, not a start.
 
-# 6. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above).
+# 6. Unlock the wallet, start the oracle, verify (recovery steps 2–4 above). Then confirm the
+#    version from the running process, not from a file on disk: getnetworkinfo must report
+#    subversion /DigiByte:9.26.7/ on both chains.
 ```
+
+Observed on the v9.26.7 upgrade (oracle box, unpruned, 16 GB, 2026-10-08): silent NSIS
+install rewrote the binaries in seconds; testnet RPC answered about 2 minutes after start;
+mainnet about 14 minutes, then the wallet reloaded locked and the oracle auto-started on
+unlock; no reindex or rebuild lines in either log; the DigiDollar stats baseline taken
+before the stop matched the one taken after. Expect a pruned 8 GB box to differ; measure it.
 
 Because the clean stop flushes the chainstate, the mainnet tip never drops below
 the DigiDollar activation height — the misleading "DigiDollar is not yet active"
