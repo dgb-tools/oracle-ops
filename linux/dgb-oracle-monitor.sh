@@ -220,9 +220,10 @@ drought_update() {
       else "bad" end' <<< "$js" 2>/dev/null || echo bad)
   case "$parsed" in
     bad|'') DR_WHY="malformed or empty getoraclesigners output (schema: integer epoch, integer height within the tip, blockhash, non-empty integer signer_ids, bitmap_valid true)"; return 0 ;;
-    nomature) DR_WHY="the window's only bundles are fewer than $mat blocks below the tip"; state_set "$key-stall-since" ""; return 0 ;;
-    empty)
+    nomature) DR_WHY="the window's only bundles are fewer than $mat blocks below the tip"; state_set "$key-stall-since" ""; state_set "$key-tip" "$tip"; return 0 ;;
+    empty)   # the window was scanned and held no bundle: the tip advances so a long stall is not later read as a coverage gap
       ss=$(state_get "$key-stall-since" ""); case "$ss" in ''|*[!0-9]*) ss=$now; state_set "$key-stall-since" "$ss" ;; esac
+      state_set "$key-tip" "$tip"
       DR_STALL_SECONDS=$((now - ss)); DR_DROUGHT=$count; DR_OUTCOME=stall; DR_WHY="no bundle in the last $scan blocks"; return 0 ;;
   esac
   read -r newest newesth oldest seen seenh seenhash epochs <<< "$parsed"
@@ -642,6 +643,7 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_drought "drought: persisted sighting, then no sighting: 34 absent bundle epochs is ok, 35 fires (completed gap 36)" 29 "4020:ok:0:0:100/4000/29-2-3" "5420:ok:0:0:101-134/auto/1-2-3" "5460:drought:1:1:135/5400/7-8-9"
   run_drought "drought: bundle epochs are the clock: a window skipping epochs counts only the epochs it shows" 29 "4020:ok:0:0:100/4000/29-2-3" "4420:ok:0:0:105/4200/1-2-3;110/4400/4-5-6"
   run_drought "drought: a valid empty window (Core's shape) is a stall: neither pages nor clears; the next bundle resumes" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5700:stall:0:1:empty" "5740:stall:0:1:empty" "5780:drought:1:1:136/5760/7-8-9" "5820:ok:0:0:137/5800/29-8-9"
+  run_drought "drought: a long stall is not a coverage gap afterwards: the tip advances on empty reads, the first bundle after it continues the count" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5540:stall:0:1:scan=100:empty" "5620:stall:0:1:scan=100:empty" "5700:stall:0:1:scan=100:empty" "5780:drought:1:1:scan=100:136/5760/7-8-9" "5820:ok:0:0:scan=100:137/5800/29-8-9"
   run_drought "drought: malformed output is unknown and touches nothing; an immature-only window is unknown" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":\"x\",\"height\":1,\"blockhash\":\"h\",\"signer_ids\":[1]}]}" "4060:unknown:0:0:raw=garbage" "4060:unknown:0:0:raw=" "4010:unknown:0:0:101/4005/3-4-5" "4060:ok:0:0:101/4040/3-4-5"
   run_drought "drought: schema: empty signer_ids, scalar signer_ids, bitmap_valid false, fractional height, height above the tip, missing blockhash are all unknown" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":[]}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":29}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":[29],\"bitmap_valid\":false}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040.5,\"blockhash\":\"h\",\"signer_ids\":[29]}]}" "4060:unknown:0:0:100/4000/1-2-3;101/4100/4-5-6" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"signer_ids\":[29]}]}" "4060:ok:0:0:101/4040/3-4-5"
   run_drought "drought: regression after a fire is unknown and keeps the alert; fires again when the chain passes; a sighting clears" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5460:unknown:0:1:134/5360/7-8-9" "5500:drought:1:1:136/5440/7-8-9" "5540:ok:0:0:137/5480/29-7-8"

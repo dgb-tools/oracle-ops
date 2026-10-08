@@ -246,6 +246,7 @@ function Update-DroughtState([hashtable]$St, [string]$Key, [int]$Id, $Sig, $Tip,
   if ($rows.Count -eq 0) {
     if ($Sig.PSObject.Properties['scan_blocks'] -and $Sig.PSObject.Properties['chain_height']) {
       $ss = & $g 'stall-since'; if ($null -eq $ss) { $ss = $NowU; $St["$Key-stall-since"] = $ss }
+      $St["$Key-tip"] = $tip   # the window was scanned and held no bundle: a long stall is not later read as a coverage gap
       $res.stallSeconds = $NowU - [int64]$ss; $res.drought = $count; $res.outcome = 'stall'; $res.why = "no bundle in the last $ScanBlocks blocks"; return $res
     }
     $res.why = $bad; return $res
@@ -269,7 +270,7 @@ function Update-DroughtState([hashtable]$St, [string]$Key, [int]$Id, $Sig, $Tip,
     if ($null -eq $oldest -or $e -lt $oldest) { $oldest = $e }
     foreach ($v in $ids) { if ([int64]$v -eq $Id -and (($e -gt $seen) -or ($e -eq $seen -and $h -gt $seenH))) { $seen = $e; $seenH = $h; $seenHash = [string]$b.blockhash } }
   }
-  if (-not $anyMature) { $res.why = "the window's only bundles are fewer than $DroughtMaturity blocks below the tip"; $St["$Key-stall-since"] = $null; return $res }
+  if (-not $anyMature) { $res.why = "the window's only bundles are fewer than $DroughtMaturity blocks below the tip"; $St["$Key-stall-since"] = $null; $St["$Key-tip"] = $tip; return $res }
   $res.newest = $newest; $res.newestHeight = $newestH
   $pnewest = & $g 'newest'; $ptip = & $g 'tip'; $last = & $g 'last'; $floor = & $g 'floor'; $lastH = & $g 'last-h'; $lastHash = & $g 'last-hash'
   if ($null -ne $pnewest) { $pnewest = [int64]$pnewest }; if ($null -ne $ptip) { $ptip = [int64]$ptip }; if ($null -ne $last) { $last = [int64]$last }; if ($null -ne $floor) { $floor = [int64]$floor }
@@ -678,6 +679,7 @@ if ($NetViewSelfTest) {
     @{ name = 'drought: persisted sighting, then no sighting: 34 absent bundle epochs is ok, 35 fires (completed gap 36)'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(5420,'ok',$false,0,'101-134/auto/1-2-3'), @(5460,'drought',$true,1,'135/5400/7-8-9')) },
     @{ name = 'drought: bundle epochs are the clock: a window skipping epochs counts only the epochs it shows'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(4420,'ok',$false,0,'105/4200/1-2-3;110/4400/4-5-6')) },
     @{ name = 'drought: a valid empty window (Core''s shape) is a stall: neither pages nor clears; the next bundle resumes'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(5460,'drought',$true,1,'101-135/auto/7-8-9'), @(5700,'stall',$false,1,'empty'), @(5740,'stall',$false,1,'empty'), @(5780,'drought',$true,1,'136/5760/7-8-9'), @(5820,'ok',$false,0,'137/5800/29-8-9')) },
+    @{ name = 'drought: a long stall is not a coverage gap afterwards: the tip advances on empty reads, the first bundle after it continues the count'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(5460,'drought',$true,1,'101-135/auto/7-8-9'), @(5540,'stall',$false,1,'empty',100), @(5620,'stall',$false,1,'empty',100), @(5700,'stall',$false,1,'empty',100), @(5780,'drought',$true,1,'136/5760/7-8-9',100), @(5820,'ok',$false,0,'137/5800/29-8-9',100)) },
     @{ name = 'drought: malformed output is unknown and touches nothing; an immature-only window is unknown'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(4060,'unknown',$false,0,'raw:{"bundles":[]}'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":"x","height":1,"blockhash":"h","signer_ids":[1]}]}'), @(4060,'unknown',$false,0,'raw:garbage'), @(4060,'unknown',$false,0,'raw:'), @(4010,'unknown',$false,0,'101/4005/3-4-5'), @(4060,'ok',$false,0,'101/4040/3-4-5')) },
     @{ name = 'drought: schema: empty signer_ids, scalar signer_ids, bitmap_valid false, fractional height, height above the tip, missing blockhash are all unknown'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":101,"height":4040,"blockhash":"h","signer_ids":[]}]}'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":101,"height":4040,"blockhash":"h","signer_ids":29}]}'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":101,"height":4040,"blockhash":"h","signer_ids":[29],"bitmap_valid":false}]}'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":101,"height":4040.5,"blockhash":"h","signer_ids":[29]}]}'), @(4060,'unknown',$false,0,'100/4000/1-2-3;101/4100/4-5-6'), @(4060,'unknown',$false,0,'raw:{"bundles":[{"epoch":101,"height":4040,"signer_ids":[29]}]}'), @(4060,'ok',$false,0,'101/4040/3-4-5')) },
     @{ name = 'drought: regression after a fire is unknown and keeps the alert; fires again when the chain passes; a sighting clears'; id = 29; steps = @(@(4020,'ok',$false,0,'100/4000/29-2-3'), @(5460,'drought',$true,1,'101-135/auto/7-8-9'), @(5460,'unknown',$false,1,'134/5360/7-8-9'), @(5500,'drought',$true,1,'136/5440/7-8-9'), @(5540,'ok',$false,0,'137/5480/29-7-8')) },
