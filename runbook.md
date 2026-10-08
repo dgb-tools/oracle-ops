@@ -188,8 +188,9 @@ which is a candidate for a validation-state divergence and nothing more.
   that is one observation, not a rule.
 - **Known limit, and the kit has no backstop for it:** a node whose peers are all on the same
   dead branch will not trip this check, and peers that all claim wrong heights would mis-trip
-  it; a slowly advancing dead branch whose ahead peers disconnect at the same moment could
-  clear it falsely. The backstop is outside the kit: a second node, an explorer, or `getchaintips` on a node
+  it; an advancing dead branch (at 15-second blocks it adds about 20 headers per cycle, enough
+  to satisfy the progress rule) whose ahead peers disconnect could clear it falsely, and the kit
+  cannot tell that local picture from a recovered tip. The backstop is outside the kit: a second node, an explorer, or `getchaintips` on a node
   you trust. The network-view check is not a backstop here: it reads the mainnet observer's
   price receipts, not chain agreement, and a testnet node on a dead branch keeps heartbeating,
   since heartbeats do not need blocks.
@@ -223,7 +224,11 @@ trick, learned the hard way on Oct 7, is not stopping until the next human step 
 #    the hour, and the wallet-unlock step waited another ~11 hours. Total slot outage about
 #    20 hours for about 20 minutes of machine work. Two rules follow:
 #      - A stop-and-wait handoff carries a ~15-minute timeout. If the next human step is not
-#        confirmed by then, relaunch the CURRENT version and redo the stop later.
+#        confirmed by then, relaunch the CURRENT version and redo the stop later, but only if
+#        installation has not begun, the binaries are unchanged, and both old processes have
+#        exited cleanly ("Shutdown: done" and no process). Never race an installer or an
+#        unfinished shutdown. A relaunch is not a restored slot: it includes the wallet unlock,
+#        the oracle start and the verification in step 6, or the slot stays dark.
 #      - An oracle outage is never worth a non-urgent release. A node without an oracle but
 #        with public services behind it (faucet, gateway, API) follows the same rule.
 
@@ -247,8 +252,9 @@ digibyte-cli -testnet stop
 
 # 4. WAIT for the clean flush, and confirm it. Observed shutdowns on our box: 2-4 minutes
 #    in July; about 7 minutes during the v9.26.6 upgrade after 35 days of uptime; 130 s
-#    during the v9.26.7 upgrade after 6 days. Flush time tracks uptime and dbcache, not the
-#    version. These are observations, not guarantees. Budget 10. Confirm "Shutdown: done" in the log AND that
+#    during the v9.26.7 upgrade after 6 days. Shutdown times varied between these runs; the
+#    effects of uptime, cache state and version were not isolated. These are observations,
+#    not guarantees. Budget 10. Confirm "Shutdown: done" in the log AND that
 #    the process has exited, for both chains, before installing. Never kill the process:
 #    that converts your clean upgrade into the hard-reboot scenario at the top of this
 #    runbook. Note the shipped systemd unit sets TimeoutStopSec=600: systemd itself will
