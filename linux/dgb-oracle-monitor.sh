@@ -83,6 +83,10 @@ NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older tha
 FORK_GAP_BLOCKS="${FORK_GAP_BLOCKS:-100}"        # a peer "claims ahead" when its startingheight exceeds our headers by more than this (triage threshold)
 FORK_MIN_PEERS="${FORK_MIN_PEERS:-2}"            # this many peers must claim ahead at once; one erroneous peer cannot set the maximum
 FORK_PROGRESS_BLOCKS="${FORK_PROGRESS_BLOCKS:-100}"  # headers advancing by at least this per cycle is a catch-up, not a stall
+DROUGHT_EPOCHS="${DROUGHT_EPOCHS:-36}"            # epochs without our slot in any bundle before paging (runbook: lottery floor ~1 false page per 85 days per slot)
+DROUGHT_SCAN_BLOCKS="${DROUGHT_SCAN_BLOCKS:-400}" # getoraclesigners window; Core caps it at 1000, which can never show 36 epochs, so sightings are persisted
+DROUGHT_STALL_BLOCKS="${DROUGHT_STALL_BLOCKS:-160}" # newest bundle older than this many blocks = network-wide bundle stall: degraded observation
+DROUGHT_TESTNET="${DROUGHT_TESTNET:-0}"           # the math is from mainnet; enable on testnet deliberately
 # Fork detector, crew review 2026-10-07. Oct 2026 lesson: a testnet node sat on a dead branch for 17 days while
 # "headers == blocks" looked synced. The check compares our HEADERS with what connected peers CLAIM.
 # startingheight is a peer's claim at connect, not a lower bound on the valid chain, so one peer cannot set it:
@@ -143,6 +147,45 @@ fork_update() {
     FK_FIRE=1
     if [ "$ibd" = "false" ] && [ "$lag" -lt 10 ]; then FK_CLASS=deadbranch; else FK_CLASS=stalledsync; fi
   fi
+  return 0
+}
+
+# Signing-drought check: the chain's own view of our slot, from local getoraclesigners (crew data 2026-10-08).
+# Every bundle names exactly 7 signers chosen by lottery among nonce-submitting oracles, so a healthy slot signs
+# about one epoch in five and a silent price path never signs. Ledger data (10,476 bundle epochs, Jul-Oct 2026, 22
+# healthy slots, 51,806 gaps): median gap 3 epochs, 99th percentile 19; gaps >= 36 are 0.073% observed and 0.041%
+# under the pure-lottery model, i.e. about one false page per 85 days per slot; everything longer in the data is a
+# real outage. Core caps getoraclesigners at 1000 blocks (~25 epochs), so one window can never show 36 epochs: the
+# newest epoch in which our id appeared is persisted ($key-last), and on the first read a floor is persisted
+# ($key-floor = the window's oldest epoch - 1), so a slot never sighted pages after DROUGHT_EPOCHS epochs of
+# observation as a stated lower bound. Outcomes (DR_OUTCOME):
+#  unknown = RPC failed, malformed output, no bundles, or the epoch went backwards: alert untouched.
+#  stall   = the newest bundle is more than DROUGHT_STALL_BLOCKS behind the tip: no bundles are landing for anyone,
+#            a degraded observation, not a drought; neither pages nor clears.
+#  ok      = drought below DROUGHT_EPOCHS: the only outcome that clears.
+#  drought = drought >= DROUGHT_EPOCHS: fires (priority high; a six-hour detection, not a fifteen-minute one).
+# args: key ourid getoraclesigners_json tipheight [epochs] [stall_blocks]
+#  -> DR_OUTCOME DR_FIRE DR_DROUGHT DR_NEWEST DR_LASTSIGNED DR_BASIS(sighting|floor) DR_NEWESTH
+drought_update() {
+  local key="$1" id="$2" js="$3" tip="$4" K="${5:-${DROUGHT_EPOCHS:-36}}" stallb="${6:-${DROUGHT_STALL_BLOCKS:-160}}" parsed newest newesth oldest seen last floor ref
+  DR_OUTCOME=unknown; DR_FIRE=0; DR_DROUGHT=""; DR_NEWEST=""; DR_LASTSIGNED=""; DR_BASIS=""; DR_NEWESTH=""
+  case "$tip" in ''|*[!0-9]*) return 0 ;; esac
+  parsed=$(jq -r --argjson id "$id" 'if type=="object" and (.bundles|type=="array") and (.bundles|length)>0
+        and all(.bundles[]; type=="object" and (.epoch|type=="number") and (.epoch==(.epoch|floor)) and (.height|type=="number") and (.signer_ids|type=="array") and all(.signer_ids[]; type=="number"))
+      then "\([.bundles[].epoch]|max) \([.bundles[].height]|max) \([.bundles[].epoch]|min) \([.bundles[] | select(.signer_ids | any(. == $id)) | .epoch] | if length>0 then max else -1 end)" else "bad" end' <<< "$js" 2>/dev/null || echo bad)
+  [ "$parsed" = "bad" ] && return 0
+  read -r newest newesth oldest seen <<< "$parsed"
+  DR_NEWEST=$newest; DR_NEWESTH=$newesth
+  last=$(state_get "$key-last" ""); floor=$(state_get "$key-floor" "")
+  case "$last" in ''|*[!0-9]*) last="" ;; esac; case "$floor" in ''|*[!0-9]*) floor="" ;; esac
+  if [ "$seen" -ge 0 ] && { [ -z "$last" ] || [ "$seen" -gt "$last" ]; }; then last=$seen; state_set "$key-last" "$last"; fi
+  if [ -z "$floor" ]; then floor=$((oldest - 1)); state_set "$key-floor" "$floor"; fi
+  ref=$floor; DR_BASIS=floor
+  if [ -n "$last" ] && [ "$last" -ge "$floor" ]; then ref=$last; DR_BASIS=sighting; fi
+  DR_LASTSIGNED="${last:-none}"; DR_DROUGHT=$((newest - ref))
+  if [ "$DR_DROUGHT" -lt 0 ]; then DR_OUTCOME=unknown; return 0; fi
+  if [ $((tip - newesth)) -gt "$stallb" ]; then DR_OUTCOME=stall; return 0; fi
+  if [ "$DR_DROUGHT" -ge "$K" ]; then DR_OUTCOME=drought; DR_FIRE=1; else DR_OUTCOME=ok; fi
   return 0
 }
 
@@ -363,6 +406,21 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
       fi
     fi
     report_check "$label-oracle$ORACLE_ID" "$reporting" "DGB ORACLE $ORACLE_ID ($label) NOT REPORTING" "$obody" urgent
+    # SIGNING DROUGHT (chain-based, local getoraclesigners; mainnet by default). See drought_update for the rule,
+    # the math, and the two state keys. report_check is called ONLY on ok (clears) and on drought (fires).
+    if [ "$ismainnet" = "1" ] || [ "$DROUGHT_TESTNET" = "1" ]; then
+      local sig; sig=$($clifn getoraclesigners "$DROUGHT_SCAN_BLOCKS" 2>/dev/null || true)
+      drought_update "$label-drought" "$ORACLE_ID" "$sig" "$blocks"
+      case "$DR_OUTCOME" in
+        ok) report_check "$label-drought" 1 "" ""; summary="$summary drought=$DR_DROUGHT" ;;
+        drought)
+          report_check "$label-drought" 0 "DGB ORACLE $ORACLE_ID ($label): NO SIGNING PARTICIPATION FOR $DR_DROUGHT EPOCHS" \
+            "Our slot $ORACLE_ID has not appeared in any oracle bundle for $DR_DROUGHT epochs (newest bundle epoch $DR_NEWEST at height $DR_NEWESTH; last sighting $DR_LASTSIGNED, basis: $DR_BASIS) while bundles keep landing. A healthy slot signs about one epoch in five: the median gap is 3 epochs, the 99th percentile 19, and a gap of 36 or more is about one in 2,400 for a healthy slot (roughly one false page per 85 days). This is the chain's own record, not an observer's view. Check locally: listoracle / getoracles for your slot, the oracle log for price and nonce messages, and the runbook's 'after any restart or upgrade' section; a silent price broadcast after a restart has presented exactly like this (slot 29, Oct 1 to 6, 2026)." high
+          summary="$summary DROUGHT=$DR_DROUGHT" ;;
+        stall) log "drought: newest bundle at height $DR_NEWESTH is more than $DROUGHT_STALL_BLOCKS blocks behind tip $blocks (drought would read $DR_DROUGHT); network-wide bundle stall, degraded observation; alert state untouched"; summary="$summary drought=stall" ;;
+        *) log "drought unknown (getoraclesigners failed, malformed, or the epoch went backwards); alert state untouched" ;;
+      esac
+    fi
     # NETWORK-VIEW check (mainnet only). The node's self-view cannot see a silent price broadcast
     # (slot 29, Oct 2026). Ask a node we do not run. The roster's `status` churns every 40-block
     # round and is NOT the signal; a fresh heartbeat with a stale last_update is. Transitions live in
@@ -466,6 +524,27 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_fork "fork: a catch-up read resets the streak; stuck counts again from 1" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1450:false:0:catchup:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:deadbranch:1
   run_fork "fork: an active alert survives unknown and the following stuck read (no false recovery); only ok clears" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 0:0:1000:false:0:unknown:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:deadbranch:1 1:0:1020:false:0:ok:0:0
   run_fork "fork: catch-up does not clear an active alert" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 1:2:1500:false:0:catchup:0:1 1:0:1520:false:0:ok:0:0
+  # drought check: synthetic bundles "epoch/height/id-id-id;epoch/height/ids" and the real Core fixture
+  dr_json() { local out="" b e h ids; for b in ${1//;/ }; do IFS=/ read -r e h ids <<< "$b"; out="$out{\"epoch\":$e,\"height\":$h,\"signer_ids\":[${ids//-/,}]},"; done; printf '{"bundles":[%s]}' "${out%,}"; }
+  run_drought() { local name="$1" id="$2"; shift 2; local ok=1 trace="" alert=0; rm -f "$STATE"/x-drought-last "$STATE"/x-drought-floor; total=$((total + 1))
+    for step in "$@"; do IFS=: read -r tip expo expf expa spec <<< "$step"
+      case "$spec" in raw=*) drought_update x-drought "$id" "${spec#raw=}" "$tip" 36 160 ;; *) drought_update x-drought "$id" "$(dr_json "$spec")" "$tip" 36 160 ;; esac
+      if [ "$DR_FIRE" = "1" ]; then alert=1; elif [ "$DR_OUTCOME" = "ok" ]; then alert=0; fi   # caller wiring under test
+      trace="$trace $DR_OUTCOME/$DR_DROUGHT/f$DR_FIRE/a$alert |"; { [ "$DR_OUTCOME" = "$expo" ] && [ "$DR_FIRE" = "$expf" ] && [ "$alert" = "$expa" ]; } || ok=0; done
+    if [ "$ok" = "1" ]; then echo "PASS  $name"; else fails=$((fails + 1)); echo "FAIL  $name:$trace"; fi; }
+  run_drought "drought: sighted in the window -> ok, drought counts from the sighting" 29 "4050:ok:0:0:100/4000/1-2-29;101/4040/3-4-5" "4090:ok:0:0:101/4040/3-4-5;102/4080/6-7-8"
+  run_drought "drought: never sighted -> floor from the first window; fires at 36 epochs of observation; a sighting clears" 29 "4050:ok:0:0:100/4000/1-2-3;101/4040/3-4-5" "5410:ok:0:0:133/5320/1-2-3;134/5360/4-5-6" "5450:drought:1:1:134/5360/4-5-6;135/5400/7-8-9" "5490:ok:0:0:135/5400/7-8-9;136/5440/29-8-9"
+  run_drought "drought: persisted sighting, then no sighting: 35 is ok, 36 fires" 29 "4050:ok:0:0:100/4000/29-2-3" "5410:ok:0:0:134/5360/1-2-3;135/5400/4-5-6" "5450:drought:1:1:136/5440/7-8-9"
+  run_drought "drought: bundle stall neither pages nor clears an active alert" 29 "4050:ok:0:0:100/4000/29-2-3" "5450:drought:1:1:136/5440/7-8-9" "5700:stall:0:1:136/5440/7-8-9" "5500:ok:0:0:137/5480/29-8-9"
+  run_drought "drought: malformed output is unknown and touches nothing" 29 "4050:ok:0:0:100/4000/29-2-3" "4090:unknown:0:0:raw={\"bundles\":[]}" "4090:unknown:0:0:raw={\"bundles\":[{\"epoch\":\"x\",\"height\":1,\"signer_ids\":[1]}]}" "4090:unknown:0:0:raw=garbage" "4090:unknown:0:0:raw=" "4090:ok:0:0:101/4040/3-4-5"
+  run_drought "drought: epoch regression (window older than the persisted sighting) is unknown" 29 "8010:ok:0:0:200/8000/29-2-3" "8010:unknown:0:0:150/6000/1-2-3"
+  fx="$(dirname "$0")/../test/drought-fixtures/getoraclesigners-1000.json"; fxraw=$(jq -c . "$fx" 2>/dev/null || echo garbage)
+  run_drought "drought fixture: slot 3 sighted at the newest epoch -> ok 0" 3 "24183636:ok:0:0:raw=$fxraw"
+  run_drought "drought fixture: slot 14 absent -> lower bound 26 on the first read, ok, and again on the second" 14 "24183636:ok:0:0:raw=$fxraw" "24183636:ok:0:0:raw=$fxraw"
+  total=$((total + 1)); rm -f "$STATE"/x-drought-last "$STATE"/x-drought-floor; state_set x-drought-floor 604540; state_set x-drought-last 604550
+  drought_update x-drought 14 "$fxraw" 24183636 36 160; a="$DR_OUTCOME/$DR_DROUGHT/$DR_BASIS"; drought_update x-drought 14 "$fxraw" 24183836 36 160; b="$DR_OUTCOME/$DR_DROUGHT"
+  drought_update x-drought 14 "$fxraw" 24183636 36 160; c="$DR_DROUGHT"
+  if [ "$a" = "drought/40/sighting" ] && [ "$b" = "stall/40" ] && [ "$c" = "40" ]; then echo "PASS  drought fixture: persisted floor 604540 and sighting 604550 -> drought 40 fires; tip+200 -> stall; basis sighting"; else fails=$((fails + 1)); echo "FAIL  drought fixture persisted: $a | $b | $c"; fi
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 

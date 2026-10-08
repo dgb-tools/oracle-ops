@@ -29,6 +29,14 @@ $ForkProgressBlocks = 100     # headers advancing by at least this per cycle is 
 if ($Cfg.PSObject.Properties['fork_gap_blocks'] -and $Cfg.fork_gap_blocks) { $ForkGapBlocks = [int]$Cfg.fork_gap_blocks }
 if ($Cfg.PSObject.Properties['fork_min_peers'] -and $Cfg.fork_min_peers) { $ForkMinPeers = [int]$Cfg.fork_min_peers }
 if ($Cfg.PSObject.Properties['fork_progress_blocks'] -and $Cfg.fork_progress_blocks) { $ForkProgressBlocks = [int]$Cfg.fork_progress_blocks }
+$DroughtEpochs = 36           # epochs without our slot in any bundle before paging (runbook: lottery floor ~1 false page per 85 days per slot)
+$DroughtScanBlocks = 400      # getoraclesigners window; Core caps it at 1000, which can never show 36 epochs, so sightings are persisted
+$DroughtStallBlocks = 160     # newest bundle older than this many blocks = network-wide bundle stall: degraded observation
+$DroughtTestnet = $false      # the math is from mainnet; enable on testnet deliberately
+if ($Cfg.PSObject.Properties['drought_epochs'] -and $Cfg.drought_epochs) { $DroughtEpochs = [int]$Cfg.drought_epochs }
+if ($Cfg.PSObject.Properties['drought_scan_blocks'] -and $Cfg.drought_scan_blocks) { $DroughtScanBlocks = [int]$Cfg.drought_scan_blocks }
+if ($Cfg.PSObject.Properties['drought_stall_blocks'] -and $Cfg.drought_stall_blocks) { $DroughtStallBlocks = [int]$Cfg.drought_stall_blocks }
+if ($Cfg.PSObject.Properties['drought_testnet']) { $DroughtTestnet = [bool]$Cfg.drought_testnet }
 if ($Cfg.PSObject.Properties['network_view_stale_seconds'] -and $Cfg.network_view_stale_seconds) { $NetViewStaleSeconds = [int]$Cfg.network_view_stale_seconds }
 if ($Cfg.PSObject.Properties['network_view_url'] -and $Cfg.network_view_url) { $NetViewUrl = [string]$Cfg.network_view_url }
 $TestArgs = @('-testnet')
@@ -190,6 +198,52 @@ function Update-ForkState([hashtable]$St, [string]$Key, [bool]$ReadOk, [int]$Ahe
     $res.fire = $true
     if (($Ibd -eq 'false') -and ($Lag -lt 10)) { $res.class = 'deadbranch' } else { $res.class = 'stalledsync' }
   }
+  return $res
+}
+
+# Signing-drought check: the chain's own view of our slot, from local getoraclesigners (crew data 2026-10-08).
+# Every bundle names exactly 7 signers chosen by lottery among nonce-submitting oracles, so a healthy slot signs about
+# one epoch in five and a silent price path never signs. Ledger data (10,476 bundle epochs, Jul-Oct 2026, 22 healthy
+# slots, 51,806 gaps): median gap 3 epochs, 99th percentile 19; gaps >= 36 are 0.073% observed and 0.041% under the
+# pure-lottery model, i.e. about one false page per 85 days per slot; everything longer in the data is a real outage.
+# Core caps getoraclesigners at 1000 blocks (~25 epochs), so one window can never show 36 epochs: the newest epoch in
+# which our id appeared is persisted ("$Key-last"), and on the first read a floor is persisted ("$Key-floor" = the
+# window's oldest epoch - 1), so a slot never sighted pages after $DroughtEpochs epochs of observation as a stated
+# lower bound. Outcomes: unknown (RPC failed, malformed, no bundles, epoch went backwards: alert untouched); stall
+# (newest bundle more than StallBlocks behind the tip: no bundles landing for anyone, degraded observation, neither
+# pages nor clears); ok (the only outcome that clears); drought (fires, priority high: a six-hour detection).
+function Update-DroughtState([hashtable]$St, [string]$Key, [int]$Id, $Sig, $Tip, [int]$Epochs = 36, [int]$StallBlocks = 160) {
+  $res = @{ outcome = 'unknown'; fire = $false; drought = $null; newest = $null; newestHeight = $null; lastSigned = 'none'; basis = '' }
+  if ($null -eq $Tip) { return $res }
+  $tip = [int64]$Tip
+  if ($null -eq $Sig -or $Sig -is [string] -or $Sig -is [array] -or -not ($Sig.PSObject.Properties['bundles'])) { return $res }
+  $rows = @($Sig.bundles); if ($rows.Count -eq 0) { return $res }
+  $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) -or ($v -is [int16]) -or ($v -is [byte]) -or (($v -is [double] -or $v -is [decimal]) -and ($v -eq [math]::Floor($v))) }
+  $newest = $null; $newestH = $null; $oldest = $null; $seen = -1
+  foreach ($b in $rows) {
+    if ($null -eq $b -or $b -is [string] -or $b -is [array]) { return $res }
+    foreach ($k in 'epoch','height','signer_ids') { if (-not $b.PSObject.Properties[$k]) { return $res } }
+    if (-not (& $isInt $b.epoch) -or -not (& $isInt $b.height)) { return $res }
+    if ($null -eq $b.signer_ids) { return $res }
+    $ids = @($b.signer_ids); foreach ($v in $ids) { if (-not (& $isInt $v)) { return $res } }
+    $e = [int64]$b.epoch; $h = [int64]$b.height
+    if ($null -eq $newest -or $e -gt $newest) { $newest = $e }
+    if ($null -eq $newestH -or $h -gt $newestH) { $newestH = $h }
+    if ($null -eq $oldest -or $e -lt $oldest) { $oldest = $e }
+    foreach ($v in $ids) { if ([int64]$v -eq $Id -and $e -gt $seen) { $seen = $e } }
+  }
+  $res.newest = $newest; $res.newestHeight = $newestH
+  $last = $null; if ($St.ContainsKey("$Key-last") -and $null -ne $St["$Key-last"]) { $last = [int64]$St["$Key-last"] }
+  $floor = $null; if ($St.ContainsKey("$Key-floor") -and $null -ne $St["$Key-floor"]) { $floor = [int64]$St["$Key-floor"] }
+  if ($seen -ge 0 -and ($null -eq $last -or $seen -gt $last)) { $last = $seen; $St["$Key-last"] = $last }
+  if ($null -eq $floor) { $floor = $oldest - 1; $St["$Key-floor"] = $floor }
+  $ref = $floor; $res.basis = 'floor'
+  if ($null -ne $last -and $last -ge $floor) { $ref = $last; $res.basis = 'sighting' }
+  if ($null -ne $last) { $res.lastSigned = $last }
+  $res.drought = $newest - $ref
+  if ($res.drought -lt 0) { $res.outcome = 'unknown'; return $res }
+  if (($tip - $newestH) -gt $StallBlocks) { $res.outcome = 'stall'; return $res }
+  if ($res.drought -ge $Epochs) { $res.outcome = 'drought'; $res.fire = $true } else { $res.outcome = 'ok' }
   return $res
 }
 
@@ -371,6 +425,25 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
     Report-Check "$Label-oracle$OracleId" $reporting "DGB ORACLE $OracleId ($Label) NOT REPORTING" $body 'urgent'
     if ($me) { $summary += "$Label-o$OracleId=$($me.status)/$($me.heartbeat_status)" }
     else     { $summary += "$Label-o$OracleId=missing" }
+    # SIGNING DROUGHT (chain-based, local getoraclesigners; mainnet by default). See Update-DroughtState for the
+    # rule, the math, and the two state keys. Report-Check is called ONLY on ok (clears) and on drought (fires).
+    if ($IsMainnet -or $DroughtTestnet) {
+      $sig = Get-DgbJson $Net @('getoraclesigners', "$DroughtScanBlocks")
+      $dr = Update-DroughtState $State "$Label-drought" $OracleId $sig $bc.blocks $DroughtEpochs $DroughtStallBlocks
+      switch ($dr.outcome) {
+        'ok' { Report-Check "$Label-drought" $true "DGB ORACLE $OracleId ($Label): NO SIGNING PARTICIPATION" '' 'high'; $summary += " drought=$($dr.drought)" }
+        'drought' {
+          Report-Check "$Label-drought" $false "DGB ORACLE $OracleId ($Label): NO SIGNING PARTICIPATION FOR $($dr.drought) EPOCHS" `
+            ("Our slot $OracleId has not appeared in any oracle bundle for $($dr.drought) epochs (newest bundle epoch $($dr.newest) at height $($dr.newestHeight); last sighting $($dr.lastSigned), basis: $($dr.basis)) while bundles keep landing. " +
+             "A healthy slot signs about one epoch in five: the median gap is 3 epochs, the 99th percentile 19, and a gap of 36 or more is about one in 2,400 for a healthy slot (roughly one false page per 85 days). " +
+             "This is the chain's own record, not an observer's view. Check locally: listoracle / getoracles for your slot, the oracle log for price and nonce messages, and the runbook's 'after any restart or upgrade' section; " +
+             "a silent price broadcast after a restart has presented exactly like this (slot 29, Oct 1 to 6, 2026).") 'high'
+          $summary += " DROUGHT=$($dr.drought)"
+        }
+        'stall' { Log "drought: newest bundle at height $($dr.newestHeight) is more than $DroughtStallBlocks blocks behind tip $($bc.blocks) (drought would read $($dr.drought)); network-wide bundle stall, degraded observation; alert state untouched"; $summary += " drought=stall" }
+        default { Log "drought unknown (getoraclesigners failed, malformed, or the epoch went backwards); alert state untouched" }
+      }
+    }
     # NETWORK-VIEW check (mainnet only). Never name a local '$net' in this function: PowerShell variable names
     # are case-insensitive and it would be the [string[]]$Net parameter, stringifying the roster.
     # The node's self-view cannot see a silent price broadcast (slot 29, Oct 2026). Ask a node we do not run.
@@ -500,6 +573,38 @@ if ($NetViewSelfTest) {
     }
     if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
   }
+  # drought check: synthetic bundles 'epoch/height/id-id-id;epoch/height/ids' and the real Core fixture
+  function New-DroughtSig([string]$Spec) {
+    $bs = @(); foreach ($b in ($Spec -split ';')) { $e, $h, $ids = $b -split '/'; $bs += @{ epoch = [int64]$e; height = [int64]$h; signer_ids = @(($ids -split '-') | ForEach-Object { [int]$_ }) } }
+    return (@{ bundles = $bs } | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+  }
+  $fxPath = Join-Path $PSScriptRoot '..\test\drought-fixtures\getoraclesigners-1000.json'
+  $fx = $null; try { $fx = Get-Content $fxPath -Raw | ConvertFrom-Json } catch { $fx = $null }
+  $dcases = @(
+    @{ name = 'drought: sighted in the window -> ok, drought counts from the sighting'; id = 29; steps = @(@(4050,'ok',$false,0,'100/4000/1-2-29;101/4040/3-4-5'), @(4090,'ok',$false,0,'101/4040/3-4-5;102/4080/6-7-8')) },
+    @{ name = 'drought: never sighted -> floor from the first window; fires at 36 epochs of observation; a sighting clears'; id = 29; steps = @(@(4050,'ok',$false,0,'100/4000/1-2-3;101/4040/3-4-5'), @(5410,'ok',$false,0,'133/5320/1-2-3;134/5360/4-5-6'), @(5450,'drought',$true,1,'134/5360/4-5-6;135/5400/7-8-9'), @(5490,'ok',$false,0,'135/5400/7-8-9;136/5440/29-8-9')) },
+    @{ name = 'drought: persisted sighting, then no sighting: 35 is ok, 36 fires'; id = 29; steps = @(@(4050,'ok',$false,0,'100/4000/29-2-3'), @(5410,'ok',$false,0,'134/5360/1-2-3;135/5400/4-5-6'), @(5450,'drought',$true,1,'136/5440/7-8-9')) },
+    @{ name = 'drought: bundle stall neither pages nor clears an active alert'; id = 29; steps = @(@(4050,'ok',$false,0,'100/4000/29-2-3'), @(5450,'drought',$true,1,'136/5440/7-8-9'), @(5700,'stall',$false,1,'136/5440/7-8-9'), @(5500,'ok',$false,0,'137/5480/29-8-9')) },
+    @{ name = 'drought: malformed output is unknown and touches nothing'; id = 29; steps = @(@(4050,'ok',$false,0,'100/4000/29-2-3'), @(4090,'unknown',$false,0,'raw:{"bundles":[]}'), @(4090,'unknown',$false,0,'raw:{"bundles":[{"epoch":"x","height":1,"signer_ids":[1]}]}'), @(4090,'unknown',$false,0,'raw:garbage'), @(4090,'unknown',$false,0,'raw:'), @(4090,'ok',$false,0,'101/4040/3-4-5')) },
+    @{ name = 'drought: epoch regression (window older than the persisted sighting) is unknown'; id = 29; steps = @(@(8010,'ok',$false,0,'200/8000/29-2-3'), @(8010,'unknown',$false,0,'150/6000/1-2-3')) },
+    @{ name = 'drought fixture: slot 3 sighted at the newest epoch -> ok 0'; id = 3; steps = @(,@(24183636,'ok',$false,0,'fixture')) },   # leading comma: a single step must stay a nested array
+    @{ name = 'drought fixture: slot 14 absent -> lower bound 26 on the first read, ok, and again on the second'; id = 14; steps = @(@(24183636,'ok',$false,0,'fixture'), @(24183636,'ok',$false,0,'fixture')) }
+  )
+  foreach ($c in $dcases) {
+    $st = @{}; $ok = $true; $trace = @(); $alert = 0; $total++
+    foreach ($s in $c.steps) {
+      $spec = "$($s[4])"; $sig = $null
+      if ($spec -eq 'fixture') { $sig = $fx } elseif ($spec.StartsWith('raw:')) { try { $sig = $spec.Substring(4) | ConvertFrom-Json } catch { $sig = $null } } else { $sig = New-DroughtSig $spec }
+      $r = Update-DroughtState $st 'x-drought' ([int]$c.id) $sig ([int64]$s[0]) 36 160
+      if ($r.fire) { $alert = 1 } elseif ($r.outcome -eq 'ok') { $alert = 0 }   # caller wiring under test
+      $trace += "$($r.outcome)/$($r.drought)/f$($r.fire)/a$alert"
+      if (($r.outcome -ne $s[1]) -or ($r.fire -ne [bool]$s[2]) -or ($alert -ne [int]$s[3])) { $ok = $false }
+    }
+    if ($ok) { Write-Output "PASS  $($c.name)" } else { $fails++; Write-Output "FAIL  $($c.name): $($trace -join ' | ')" }
+  }
+  $total++; $st = @{ 'x-drought-last' = [int64]604550; 'x-drought-floor' = [int64]604540 }
+  $a = Update-DroughtState $st 'x-drought' 14 $fx ([int64]24183636) 36 160; $b = Update-DroughtState $st 'x-drought' 14 $fx ([int64]24183836) 36 160; $c2 = Update-DroughtState $st 'x-drought' 14 $fx ([int64]24183636) 36 160
+  if (($a.outcome -eq 'drought') -and ($a.drought -eq 40) -and ($a.basis -eq 'sighting') -and ($b.outcome -eq 'stall') -and ($b.drought -eq 40) -and ($c2.drought -eq 40)) { Write-Output "PASS  drought fixture: persisted floor 604540 and sighting 604550 -> drought 40 fires; tip+200 -> stall; basis sighting" } else { $fails++; Write-Output "FAIL  drought fixture persisted: $($a.outcome)/$($a.drought)/$($a.basis) | $($b.outcome)/$($b.drought) | $($c2.drought)" }
   Write-Output "netview self-test: $($total - $fails)/$total passed"; exit $fails
 }
 

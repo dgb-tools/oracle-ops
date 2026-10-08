@@ -140,6 +140,38 @@ never fire or clear an alert. Pending evidence is reset by zeroed, unknown and o
 reads; an active alert stands until a read with a fresh heartbeat and a recent positive
 timestamp. The alert asks you to corroborate; it does not tell you to cycle.
 
+## Signing drought: the chain's own record of your slot (2026-10-08)
+
+Every oracle bundle names exactly seven signers, chosen by a lottery among the oracles that
+submitted nonces for that epoch. A healthy slot therefore signs about one epoch in five, and
+a slot whose price path is silent never signs. That makes the chain itself a silent-slot
+detector that needs no outside observer. From the participation ledger (10,476 bundle epochs,
+July 18 to October 1, 2026; the 22 slots with a normal signing rate; 51,806 gaps between
+consecutive signings): the median gap is 3 epochs and the 99th percentile 19. Gaps of 36 or
+more epochs are 0.073% of healthy gaps observed and 0.041% under the pure-lottery model, which
+is about one false page per 85 days per slot; every gap longer than that in the data lines up
+with a known outage (the August 27 crash; one operator's two slots going dark together four
+times). Slot 29's own silence of October 1 to 6 would have paged six hours in.
+
+Both monitors now run this check (`drought_epochs` 36, `drought_scan_blocks` 400,
+`drought_stall_blocks` 160; mainnet by default, `drought_testnet` to enable it there, since
+the numbers above are mainnet's). Rule: our slot absent from every bundle for 36 epochs while
+bundles keep landing pages at normal priority. Two things to know:
+
+- **Core caps `getoraclesigners` at 1000 blocks**, about 25 epochs, so one window can never
+  show a 36-epoch drought. The monitor persists the newest epoch in which your slot appeared,
+  and on its first run a floor (the window's oldest epoch minus one). A slot never sighted
+  pages after 36 epochs of observation, as a stated lower bound.
+- **A network-wide bundle stall is not a drought.** If the newest bundle is more than 160
+  blocks behind the tip, nobody is signing; the check logs a degraded observation and neither
+  pages nor clears. Only a read with the drought below 36 clears an active alert.
+
+It is a six-hour detection, not a fifteen-minute one. The network-view check above remains
+the fast path; what its miss should mean is under review against the observer data gathered
+on October 8 (the observer zeroes a slot's `last_update` whenever no price message has arrived
+since its last pending-message clear, which happens every few seconds to minutes, so a single
+zeroed read is not evidence of anything).
+
 ## "headers == blocks" is not "synced" when peers are far ahead (testnet fork, Sep–Oct 2026)
 
 The oracle box's testnet node sat on a dead branch from 2026-09-20 to 2026-10-07 while every
