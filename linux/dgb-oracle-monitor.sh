@@ -83,7 +83,7 @@ NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older tha
 FORK_GAP_BLOCKS="${FORK_GAP_BLOCKS:-100}"        # a peer "claims ahead" when its startingheight exceeds our headers by more than this (triage threshold)
 FORK_MIN_PEERS="${FORK_MIN_PEERS:-2}"            # this many peers must claim ahead at once; one erroneous peer cannot set the maximum
 FORK_PROGRESS_BLOCKS="${FORK_PROGRESS_BLOCKS:-100}"  # headers advancing by at least this per cycle is a catch-up, not a stall
-DROUGHT_EPOCHS="${DROUGHT_EPOCHS:-36}"            # epochs without our slot in any bundle before paging (runbook: lottery floor ~1 false page per 85 days per slot)
+DROUGHT_EPOCHS="${DROUGHT_EPOCHS:-36}"            # completed-gap threshold from the ledger packet (provisional); the monitor fires on the 35th absent bundle epoch
 DROUGHT_SCAN_BLOCKS="${DROUGHT_SCAN_BLOCKS:-100}" # getoraclesigners window: Core's default; the scan walks every block under cs_main, and sightings are persisted
 DROUGHT_STALL_BLOCKS="${DROUGHT_STALL_BLOCKS:-160}" # newest mature bundle more than this many blocks behind the tip = no recent bundle on this node's chain (stall)
 DROUGHT_STALL_WARN_SECONDS="${DROUGHT_STALL_WARN_SECONDS:-3600}" # a stall older than this raises the degraded-observation warning
@@ -152,81 +152,121 @@ fork_update() {
 }
 
 # Signing-drought check: chain-participation evidence for our slot, from local getoraclesigners (crew data and
-# FIX, 2026-10-08). Every bundle names exactly 7 signers chosen by lottery among nonce-submitting oracles. In the
-# participation ledger (10,476 bundle epochs, Jul 18 to Oct 1, 2026) the 22 slots with a normal signing rate
-# signed about one epoch in five: median gap 3 epochs, 99th percentile 19; gaps >= 36 were 0.073% of healthy gaps
-# (0.041% under an independent, equal-probability model, which the rates support but do not prove), and every
-# longer gap lines up with a known outage. Slot 29's silent price path of Oct 1-6 did not sign for its duration.
-# Method, assumptions and outage labels: data/drought/ledger-gaps-2026-10-08.md. K=36 and the 160-block stall
-# bound are PROVISIONAL triage thresholds. Absent participation is evidence, not proof of a silent price path.
+# FIX rounds, 2026-10-08). Every bundle names exactly 7 signers chosen by lottery among nonce-submitting oracles.
+# In the participation ledger (10,476 bundle epochs, Jul 18 to Oct 1, 2026) the 22 slots with a normal signing
+# rate signed about one epoch in five: median gap 3 bundle epochs, 99th percentile 19; completed gaps >= 36 were
+# 0.073% of healthy gaps (0.041% under an independent, equal-probability model, an assumption the similar
+# marginal rates are consistent with but do not establish). Slot 29's silent price path of Oct 1-6 did not sign
+# for its duration: one case. Method, assumptions and the labeling of every gap >= 36:
+# data/drought/ledger-gaps-2026-10-08.md. DROUGHT_EPOCHS (36) and the 160-block bound are PROVISIONAL triage
+# thresholds. Absent participation is evidence, not proof of a silent price path.
+# CLOCK: the packet counts BUNDLE epochs (epochs in which a bundle was included), and so does this check: it
+# keeps a persisted count of distinct bundle epochs observed since the reference point, and fires when that count
+# reaches DROUGHT_EPOCHS - 1 (35 absent bundle epochs between two signings is a completed gap of 36). Epochs
+# with no bundle do not advance it, which is also why a bundle stall is not a drought.
 # Core clamps getoraclesigners to 1..1000 blocks and walks every block of the window under cs_main, so the default
-# window is Core's default of 100 and sightings are persisted. State keys ($key-*): last = newest epoch in which
-# our id appeared in a mature bundle; floor = the epoch evidence restarts from (the oldest epoch of the first
-# window, which may be only partly covered: a lower bound of OBSERVATION, not of chain history); tip = last
-# processed tip; newest = last processed newest epoch; stall-since = when the current stall began.
-# Only bundles at least DROUGHT_MATURITY (12) blocks below the tip count, so a shallow reorg cannot record a
-# sighting the active chain lost. Outcomes (DR_OUTCOME; DR_WHY explains unknown):
-#  unknown = RPC failed; malformed output (schema below); a bundle above the tip; no mature bundle; the newest
-#            epoch went backwards (regression: state untouched, so an active alert cannot clear on it); or a
-#            coverage gap (the tip advanced more than the window since the last read, so blocks were never
-#            scanned: evidence restarts from this window's oldest epoch and the floor is reset). Alert untouched.
-#  stall   = the newest mature bundle is more than DROUGHT_STALL_BLOCKS behind the tip: no recent bundle on THIS
-#            node's chain (a lagging or stalled local tip does not show here; the sync and fork checks own that).
-#            Neither pages nor clears; DR_STALL_SECONDS tells the caller how long, for the degraded-observation
-#            warning.
-#  ok      = drought below DROUGHT_EPOCHS: the only outcome that clears.
-#  drought = drought >= DROUGHT_EPOCHS: fires (priority high; about six hours at full bundle rate).
-# Schema: bundles[] objects with integer epoch >= 0, integer height in [0, tip], signer_ids a non-empty array of
-# integers, and bitmap_valid true when present; anything else makes the whole read unknown (same in PowerShell).
-# A state wipe resets the floor and can ok-clear an active drought alert; the runbook says so.
-# args: key ourid getoraclesigners_json tipheight [epochs] [stall_blocks] [scan_blocks]
-#  -> DR_OUTCOME DR_FIRE DR_DROUGHT DR_NEWEST DR_NEWESTH DR_LASTSIGNED DR_BASIS(sighting|floor) DR_STALL_SECONDS DR_WHY
+# window is Core's default of 100 and everything is persisted. State keys ($key-*):
+#  last / last-h / last-hash = the newest epoch in which our id appeared in a mature bundle, with that bundle's
+#      height and block hash. On every read the caller fetches getblockhash(last-h) and passes it in; a hash
+#      mismatch means the sighting was reorged out: it is discarded and evidence restarts. No hash = unverifiable
+#      = unknown, state untouched.
+#  floor = the epoch evidence (re)starts from: the oldest epoch of the first window, or of the window after a
+#      coverage gap or a discarded sighting. It may be only partly covered. A lower bound of OBSERVATION.
+#  count = distinct bundle epochs observed above the reference (last sighting if at or above the floor, else the
+#      floor). tip / newest = last processed tip and newest epoch. stall-since = when the current stall began.
+# Only bundles at least DROUGHT_MATURITY (12) blocks below the tip count. Outcomes (DR_OUTCOME; DR_WHY explains):
+#  unknown     = RPC failed; malformed output (schema below); a bundle above the tip; a valid window whose only
+#                bundles are immature; the newest epoch went backwards (regression: state untouched); the sighting
+#                anchor could not be verified (state untouched) or did not match (sighting discarded, evidence
+#                restarted); or a coverage gap (the tip advanced more than window minus maturity since the last
+#                read, so blocks were never scanned: evidence restarts from this window's oldest epoch). Alert
+#                untouched in every case: an active drought alert survives all of these.
+#  stall       = a VALID window with no bundle at all (Core's shape, bundles empty), or the newest mature bundle
+#                more than DROUGHT_STALL_BLOCKS behind the tip (reachable only when the scan is wider than that
+#                bound): no recent bundle on THIS node's chain. Neither pages nor clears; DR_STALL_SECONDS tells
+#                the caller how long, for the degraded-observation warning. A lagging or stalled local tip does
+#                not show here; the sync and fork checks own that.
+#  ok          = a sighting is the reference (basis=sighting) and the count is below the threshold: the ONLY
+#                outcome that clears an alert.
+#  unconfirmed = the floor is the reference (no sighting since evidence (re)started) and the count is below the
+#                threshold: nothing is known either way; neither pages nor clears. Rebuilding evidence is not
+#                recovery.
+#  drought     = count >= DROUGHT_EPOCHS - 1: fires (priority high; about six hours at full bundle rate).
+# Schema: bundles[] objects with integer epoch >= 0, integer height in [0, tip], string blockhash, signer_ids a
+# non-empty array of integers, bitmap_valid true when present; anything else makes the whole read unknown (same
+# in PowerShell). A state wipe restarts evidence (floor), which cannot clear an alert by itself: only a sighting.
+# args: key ourid getoraclesigners_json tipheight [epochs] [stall_blocks] [scan_blocks] [anchor_hash]
+#  -> DR_OUTCOME DR_FIRE DR_DROUGHT(count) DR_NEWEST DR_NEWESTH DR_LASTSIGNED DR_BASIS DR_STALL_SECONDS DR_WHY
 drought_update() {
-  local key="$1" id="$2" js="$3" tip="$4" K="${5:-${DROUGHT_EPOCHS:-36}}" stallb="${6:-${DROUGHT_STALL_BLOCKS:-160}}" scan="${7:-${DROUGHT_SCAN_BLOCKS:-100}}"
-  local mat="${DROUGHT_MATURITY:-12}" mature parsed newest newesth oldest seen last floor ref ptip pnewest now v ss
+  local key="$1" id="$2" js="$3" tip="$4" K="${5:-${DROUGHT_EPOCHS:-36}}" stallb="${6:-${DROUGHT_STALL_BLOCKS:-160}}" scan="${7:-${DROUGHT_SCAN_BLOCKS:-100}}" anchor="${8:-}"
+  local mat="${DROUGHT_MATURITY:-12}" mature parsed newest newesth oldest seen seenh seenhash epochs last lasth lasthash floor count ptip pnewest now v ss restart=0 n
   DR_OUTCOME=unknown; DR_FIRE=0; DR_DROUGHT=""; DR_NEWEST=""; DR_NEWESTH=""; DR_LASTSIGNED=""; DR_BASIS=""; DR_STALL_SECONDS=0; DR_WHY=""
   case "$tip" in ''|*[!0-9]*) DR_WHY="tip unknown"; return 0 ;; esac
-  mature=$((tip - mat))
+  mature=$((tip - mat)); now="${NOW:-$(date +%s)}"
+  count=$(state_get "$key-count" 0); case "$count" in ''|*[!0-9]*) count=0 ;; esac
   parsed=$(jq -r --argjson id "$id" --argjson tip "$tip" --argjson mature "$mature" '
-      if type=="object" and (.bundles|type=="array") and (.bundles|length)>0
+      if type=="object" and (.bundles|type=="array") and (.bundles|length)==0 and has("scan_blocks") and has("chain_height") then "empty"
+      elif type=="object" and (.bundles|type=="array") and (.bundles|length)>0
          and all(.bundles[]; type=="object"
                    and (.epoch|type=="number") and (.epoch==(.epoch|floor)) and (.epoch>=0)
                    and (.height|type=="number") and (.height==(.height|floor)) and (.height>=0) and (.height<=$tip)
+                   and (.blockhash|type=="string") and ((.blockhash|length)>0)
                    and (.signer_ids|type=="array") and ((.signer_ids|length)>=1) and all(.signer_ids[]; type=="number" and .==floor)
                    and ((has("bitmap_valid")|not) or .bitmap_valid==true))
       then ([.bundles[] | select(.height <= $mature)]) as $m
            | if ($m|length)==0 then "nomature"
-             else "\([$m[].epoch]|max) \([$m[].height]|max) \([$m[].epoch]|min) \([$m[] | select(.signer_ids|any(.==$id)) | .epoch] | if length>0 then max else -1 end)" end
+             else ([$m[] | select(.signer_ids|any(.==$id))] | sort_by(.epoch, .height) | last) as $s
+                  | "\([$m[].epoch]|max) \([$m[].height]|max) \([$m[].epoch]|min) \(if $s then "\($s.epoch) \($s.height) \($s.blockhash)" else "-1 0 -" end) \([$m[].epoch]|unique|join(","))" end
       else "bad" end' <<< "$js" 2>/dev/null || echo bad)
-  case "$parsed" in bad|'') DR_WHY="malformed or empty getoraclesigners output (schema: integer epoch, integer height within the tip, non-empty integer signer_ids, bitmap_valid true)"; return 0 ;;
-                     nomature) DR_WHY="no bundle at least $mat blocks below the tip"; return 0 ;; esac
-  read -r newest newesth oldest seen <<< "$parsed"
-  for v in "$newest" "$newesth" "$oldest"; do case "$v" in ''|*[!0-9]*) DR_WHY="parse failure"; return 0 ;; esac; done
+  case "$parsed" in
+    bad|'') DR_WHY="malformed or empty getoraclesigners output (schema: integer epoch, integer height within the tip, blockhash, non-empty integer signer_ids, bitmap_valid true)"; return 0 ;;
+    nomature) DR_WHY="the window's only bundles are fewer than $mat blocks below the tip"; state_set "$key-stall-since" ""; return 0 ;;
+    empty)
+      ss=$(state_get "$key-stall-since" ""); case "$ss" in ''|*[!0-9]*) ss=$now; state_set "$key-stall-since" "$ss" ;; esac
+      DR_STALL_SECONDS=$((now - ss)); DR_DROUGHT=$count; DR_OUTCOME=stall; DR_WHY="no bundle in the last $scan blocks"; return 0 ;;
+  esac
+  read -r newest newesth oldest seen seenh seenhash epochs <<< "$parsed"
+  for v in "$newest" "$newesth" "$oldest" "$seenh"; do case "$v" in ''|*[!0-9]*) DR_WHY="parse failure"; return 0 ;; esac; done
   case "$seen" in ''|*[!0-9-]*) seen=-1 ;; esac
   DR_NEWEST=$newest; DR_NEWESTH=$newesth
   pnewest=$(state_get "$key-newest" ""); ptip=$(state_get "$key-tip" ""); last=$(state_get "$key-last" ""); floor=$(state_get "$key-floor" "")
+  lasth=$(state_get "$key-last-h" ""); lasthash=$(state_get "$key-last-hash" "")
   case "$pnewest" in ''|*[!0-9]*) pnewest="" ;; esac; case "$ptip" in ''|*[!0-9]*) ptip="" ;; esac
-  case "$last" in ''|*[!0-9]*) last="" ;; esac; case "$floor" in ''|*[!0-9]*) floor="" ;; esac
+  case "$last" in ''|*[!0-9]*) last="" ;; esac; case "$floor" in ''|*[!0-9]*) floor="" ;; esac; case "$lasth" in ''|*[!0-9]*) lasth="" ;; esac
+  # 1. validate before any state write: regression, then the sighting anchor
   if [ -n "$pnewest" ] && [ "$newest" -lt "$pnewest" ]; then DR_WHY="newest epoch $newest is below the last processed epoch $pnewest (reorg, or state from another chain); state untouched"; return 0; fi
-  if [ -n "$ptip" ] && [ $((tip - ptip)) -gt $((scan - mat)) ]; then
-    floor=$oldest; state_set "$key-floor" "$floor"; state_set "$key-tip" "$tip"; state_set "$key-newest" "$newest"
-    if [ "$seen" -ge 0 ]; then last=$seen; state_set "$key-last" "$last"; fi
-    DR_WHY="coverage gap: the tip advanced $((tip - ptip)) blocks since the last read, more than the $scan-block window covers; evidence restarts from epoch $oldest"; return 0
+  if [ -n "$last" ]; then
+    if [ -z "$lasth" ] || [ -z "$lasthash" ]; then restart=1; DR_WHY="persisted sighting at epoch $last has no block anchor (state from an older version); discarded, evidence restarts from epoch $oldest"
+    elif [ -z "$anchor" ]; then DR_WHY="sighting anchor at height $lasth could not be verified (getblockhash failed); state untouched"; return 0
+    elif [ "$anchor" != "$lasthash" ]; then restart=1; DR_WHY="sighting at epoch $last (height $lasth) is no longer on the active chain; discarded, evidence restarts from epoch $oldest"; fi
+    if [ "$restart" = "1" ]; then last=""; state_set "$key-last" ""; state_set "$key-last-h" ""; state_set "$key-last-hash" ""; fi
   fi
-  if [ "$seen" -ge 0 ] && { [ -z "$last" ] || [ "$seen" -gt "$last" ]; }; then last=$seen; state_set "$key-last" "$last"; fi
-  if [ -z "$floor" ]; then floor=$oldest; state_set "$key-floor" "$floor"; fi
-  state_set "$key-tip" "$tip"; state_set "$key-newest" "$newest"
-  ref=$floor; DR_BASIS=floor
-  if [ -n "$last" ] && [ "$last" -ge "$floor" ]; then ref=$last; DR_BASIS=sighting; fi
-  DR_LASTSIGNED="${last:-none}"; DR_DROUGHT=$((newest - ref))
-  if [ "$DR_DROUGHT" -lt 0 ]; then DR_WHY="drought negative (state older than this check's keys)"; return 0; fi
-  now="${NOW:-$(date +%s)}"
+  # 2. coverage gap
+  if [ "$restart" = "0" ] && [ -n "$ptip" ] && [ $((tip - ptip)) -gt $((scan - mat)) ]; then restart=1; DR_WHY="coverage gap: the tip advanced $((tip - ptip)) blocks since the last read, more than the $scan-block window covers; evidence restarts from epoch $oldest"; fi
+  # 3. the clock: distinct bundle epochs observed above the reference
+  count_above() { local ref="$1" e c=0; for e in ${epochs//,/ }; do [ "$e" -gt "$ref" ] && c=$((c + 1)); done; echo "$c"; }
+  if [ "$restart" = "1" ] || [ -z "$floor" ] || [ -z "$pnewest" ]; then
+    floor=$oldest; state_set "$key-floor" "$floor"
+    if [ "$seen" -ge 0 ]; then last=$seen; lasth=$seenh; lasthash=$seenhash; state_set "$key-last" "$last"; state_set "$key-last-h" "$lasth"; state_set "$key-last-hash" "$lasthash"; count=$(count_above "$seen")
+    else count=$(count_above "$floor"); fi
+  elif [ "$seen" -ge 0 ] && { [ -z "$last" ] || [ "$seen" -gt "$last" ]; }; then
+    last=$seen; lasth=$seenh; lasthash=$seenhash; state_set "$key-last" "$last"; state_set "$key-last-h" "$lasth"; state_set "$key-last-hash" "$lasthash"; count=$(count_above "$seen")
+  else
+    n=$(count_above "$pnewest"); count=$((count + n))
+  fi
+  state_set "$key-count" "$count"; state_set "$key-tip" "$tip"; state_set "$key-newest" "$newest"
+  DR_DROUGHT=$count; DR_LASTSIGNED="${last:-none}"; DR_BASIS=floor
+  if [ -n "$last" ] && [ "$last" -ge "$floor" ]; then DR_BASIS=sighting; fi
+  if [ "$restart" = "1" ]; then return 0; fi
+  # 4. stall by distance (only reachable when the scan is wider than the bound)
   if [ $((tip - newesth)) -gt "$stallb" ]; then
     ss=$(state_get "$key-stall-since" ""); case "$ss" in ''|*[!0-9]*) ss=$now; state_set "$key-stall-since" "$ss" ;; esac
-    DR_STALL_SECONDS=$((now - ss)); DR_OUTCOME=stall; return 0
+    DR_STALL_SECONDS=$((now - ss)); DR_OUTCOME=stall; DR_WHY="newest mature bundle is $((tip - newesth)) blocks behind the tip"; return 0
   fi
   state_set "$key-stall-since" ""
-  if [ "$DR_DROUGHT" -ge "$K" ]; then DR_OUTCOME=drought; DR_FIRE=1; else DR_OUTCOME=ok; fi
+  if [ "$count" -ge $((K - 1)) ]; then DR_OUTCOME=drought; DR_FIRE=1
+  elif [ "$DR_BASIS" = "sighting" ]; then DR_OUTCOME=ok
+  else DR_OUTCOME=unconfirmed; fi
   return 0
 }
 
@@ -447,25 +487,29 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
       fi
     fi
     report_check "$label-oracle$ORACLE_ID" "$reporting" "DGB ORACLE $ORACLE_ID ($label) NOT REPORTING" "$obody" urgent
-    # SIGNING DROUGHT (chain-participation evidence, local getoraclesigners; mainnet by default). See
-    # drought_update for the rule, the math, and the state keys. report_check is called ONLY on ok (clears both
-    # keys), on drought (fires), and on a stall that has persisted past DROUGHT_STALL_WARN_SECONDS (degraded
-    # observation, its own key, cleared by the next ok or drought read).
+    # SIGNING DROUGHT (chain-participation evidence, local getoraclesigners; mainnet by default). See drought_update
+    # for the rule, the clock, and the state keys. report_check is called ONLY on ok (clears both keys), on drought
+    # (fires; clears the observation key), on unconfirmed (clears the observation key only), and on a stall that
+    # has persisted past DROUGHT_STALL_WARN_SECONDS (degraded observation, its own key).
     if [ "$ismainnet" = "1" ] || [ "$DROUGHT_TESTNET" = "1" ]; then
-      local sig; sig=$($clifn getoraclesigners "$DROUGHT_SCAN_BLOCKS" 2>/dev/null || true)
-      drought_update "$label-drought" "$ORACLE_ID" "$sig" "$blocks"
+      local sig lasth anchor=""
+      sig=$($clifn getoraclesigners "$DROUGHT_SCAN_BLOCKS" 2>/dev/null || true)
+      lasth=$(state_get "$label-drought-last-h" ""); case "$lasth" in ''|*[!0-9]*) lasth="" ;; esac
+      [ -n "$lasth" ] && anchor=$($clifn getblockhash "$lasth" 2>/dev/null || true)
+      drought_update "$label-drought" "$ORACLE_ID" "$sig" "$blocks" "$DROUGHT_EPOCHS" "$DROUGHT_STALL_BLOCKS" "$DROUGHT_SCAN_BLOCKS" "$anchor"
       case "$DR_OUTCOME" in
         ok) report_check "$label-drought" 1 "" ""; report_check "$label-drought-observation" 1 "" ""; summary="$summary drought=$DR_DROUGHT" ;;
+        unconfirmed) report_check "$label-drought-observation" 1 "" ""; summary="$summary drought=$DR_DROUGHT?"; log "drought: $DR_DROUGHT bundle epochs observed since evidence started at epoch $(state_get "$label-drought-floor" "?") with no sighting of slot $ORACLE_ID; unconfirmed, alert state untouched" ;;
         drought)
-          report_check "$label-drought" 0 "DGB ORACLE $ORACLE_ID ($label): NO SIGNING PARTICIPATION FOR $DR_DROUGHT EPOCHS" \
-            "Our slot $ORACLE_ID has not appeared in any oracle bundle on this node's chain for $DR_DROUGHT epochs (newest mature bundle epoch $DR_NEWEST at height $DR_NEWESTH; last sighting $DR_LASTSIGNED; basis: $DR_BASIS, where floor means a lower bound since monitoring began) while bundles keep landing. In the participation ledger a healthy slot signs about one epoch in five (median gap 3 epochs, 99th percentile 19); a gap of 36 or more was 0.073% of healthy gaps and every longer gap was a known outage. This is evidence of absent participation on this node's chain, not proof of a silent price path. Corroborate: listoracle / getoracles for your slot, the oracle log for price and nonce messages, a second node or an observer, and the runbook's 'after any restart or upgrade' section; a silent price broadcast after a restart presented exactly like this on slot 29, Oct 1 to 6, 2026." high
+          report_check "$label-drought" 0 "DGB ORACLE $ORACLE_ID ($label): NO SIGNING PARTICIPATION IN THE LAST $DR_DROUGHT BUNDLE EPOCHS" \
+            "Our slot $ORACLE_ID has not appeared in any of the last $DR_DROUGHT oracle bundle epochs observed on this node's chain (newest mature bundle epoch $DR_NEWEST at height $DR_NEWESTH; last sighting $DR_LASTSIGNED; basis: $DR_BASIS, where floor means counted since monitoring (re)started). In the participation ledger a healthy slot signs about one epoch in five (median gap 3 bundle epochs, 99th percentile 19); a completed gap of 36 or more was 0.073% of healthy gaps, and most longer gaps coincide with dated events. This is evidence of absent participation on this node's chain, not proof of a silent price path; the thresholds are provisional. Corroborate: listoracle / getoracles for your slot, the oracle log for price and nonce messages, a second node or an observer, and the runbook's 'after any restart or upgrade' section; a silent price broadcast after a restart presented exactly like this on slot 29, Oct 1 to 6, 2026." high
           report_check "$label-drought-observation" 1 "" ""; summary="$summary DROUGHT=$DR_DROUGHT" ;;
         stall)
           summary="$summary drought=stall"
           if [ "$DR_STALL_SECONDS" -ge "${DROUGHT_STALL_WARN_SECONDS:-3600}" ]; then
             report_check "$label-drought-observation" 0 "DGB ORACLE $ORACLE_ID ($label): DROUGHT CHECK DEGRADED, NO RECENT BUNDLE ON THIS NODE'S CHAIN" \
-              "The newest mature oracle bundle this node has is at height $DR_NEWESTH, more than $DROUGHT_STALL_BLOCKS blocks behind its tip $blocks, and has been for $((DR_STALL_SECONDS / 60)) minutes. The signing-drought check cannot assess slot $ORACLE_ID while this persists (its drought would read $DR_DROUGHT). This is a local observation: no recent bundle on this node's chain. Possible causes include miners not including bundles, the oracle network not producing them, or this node on a branch without them; a lagging or stalled local tip looks different and is covered by the sync and fork checks. It clears on the next read that finds a recent bundle." high
-          else log "drought: newest mature bundle at height $DR_NEWESTH is more than $DROUGHT_STALL_BLOCKS blocks behind tip $blocks for $((DR_STALL_SECONDS / 60)) min (drought would read $DR_DROUGHT); no recent bundle on this node's chain; alert state untouched"; fi ;;
+              "This node's chain shows no oracle bundle in the last $DROUGHT_SCAN_BLOCKS blocks ($DR_WHY), and has not for $((DR_STALL_SECONDS / 60)) minutes. The signing-drought check cannot assess slot $ORACLE_ID while this persists (its count stands at $DR_DROUGHT). This is a local observation: no recent bundle on this node's chain. Possible causes include miners not including bundles, the oracle network not producing them, or this node on a branch without them; a lagging or stalled local tip looks different and is covered by the sync and fork checks. It clears on the next read that finds a bundle." high
+          else log "drought: $DR_WHY for $((DR_STALL_SECONDS / 60)) min (count stands at $DR_DROUGHT); no recent bundle on this node's chain; alert state untouched"; fi ;;
         *) log "drought unknown: ${DR_WHY:-getoraclesigners failed}; alert state untouched" ;;
       esac
     fi
@@ -572,38 +616,50 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_fork "fork: a catch-up read resets the streak; stuck counts again from 1" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1450:false:0:catchup:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:deadbranch:1
   run_fork "fork: an active alert survives unknown and the following stuck read (no false recovery); only ok clears" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 0:0:1000:false:0:unknown:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:deadbranch:1 1:0:1020:false:0:ok:0:0
   run_fork "fork: catch-up does not clear an active alert" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 1:2:1500:false:0:catchup:0:1 1:0:1520:false:0:ok:0:0
-  # drought check: synthetic bundles "epoch/height/id-id-id;epoch/height/ids" and the real Core fixture.
-  # Steps "tip:expectOutcome:expectFire:expectAlertAfter:spec"; DR_SCAN (default 100000) disables coverage-gap
-  # detection except where a case sets it; NOW is set per step by the caller where stall timing matters.
-  dr_json() { local out="" b e h ids; for b in ${1//;/ }; do IFS=/ read -r e h ids <<< "$b"; out="$out{\"epoch\":$e,\"height\":$h,\"signer_ids\":[${ids//-/,}]},"; done; printf '{"bundles":[%s]}' "${out%,}"; }
-  dr_reset() { rm -f "$STATE"/x-drought-last "$STATE"/x-drought-floor "$STATE"/x-drought-tip "$STATE"/x-drought-newest "$STATE"/x-drought-stall-since; }
-  run_drought() { local name="$1" id="$2"; shift 2; local ok=1 trace="" alert=0 scan="${DR_SCAN:-100000}"; dr_reset; total=$((total + 1))
-    for step in "$@"; do IFS=: read -r tip expo expf expa spec <<< "$step"
-      case "$spec" in raw=*) drought_update x-drought "$id" "${spec#raw=}" "$tip" 36 160 "$scan" ;; *) drought_update x-drought "$id" "$(dr_json "$spec")" "$tip" 36 160 "$scan" ;; esac
-      if [ "$DR_FIRE" = "1" ]; then alert=1; elif [ "$DR_OUTCOME" = "ok" ]; then alert=0; fi   # caller wiring under test
+  # drought check: synthetic bundles and the real Core fixture. Spec items "e/h/ids" or "e1-e2/auto/ids" (one
+  # bundle per epoch at height e*40), ';'-separated; "empty" = Core's valid empty window; "raw=<json>". Steps
+  # "tip:expectOutcome:expectFire:expectAlertAfter[:scan=N][:anchor=none|reorged]:spec" (spec last: raw JSON may
+  # contain colons). The harness replays the caller: it passes the persisted sighting hash back as the chain's
+  # answer unless a step says otherwise.
+  dr_json() { local out="" b e h ids lo hi; for b in ${1//;/ }; do IFS=/ read -r e h ids <<< "$b"
+      if [ "$h" = "auto" ]; then lo="${e%-*}"; hi="${e#*-}"; for ((e=lo; e<=hi; e++)); do out="$out{\"epoch\":$e,\"height\":$((e * 40)),\"blockhash\":\"h$((e * 40))\",\"signer_ids\":[${ids//-/,}]},"; done
+      else out="$out{\"epoch\":$e,\"height\":$h,\"blockhash\":\"h$h\",\"signer_ids\":[${ids//-/,}]},"; fi; done; printf '{"bundles":[%s]}' "${out%,}"; }
+  dr_reset() { local k; for k in last last-h last-hash floor tip newest count stall-since; do rm -f "$STATE/x-drought-$k"; done; }
+  dr_call() { # id tip spec scan anchormode
+    local id="$1" tip="$2" spec="$3" scan="$4" mode="$5" anchor js
+    case "$mode" in none) anchor="" ;; reorged) anchor="reorged" ;; *) anchor=$(state_get x-drought-last-hash "") ;; esac
+    case "$spec" in raw=*) js="${spec#raw=}" ;; empty) js="{\"chain_height\":$tip,\"scan_blocks\":100,\"bundle_count\":0,\"bundles\":[]}" ;; *) js=$(dr_json "$spec") ;; esac
+    drought_update x-drought "$id" "$js" "$tip" 36 160 "$scan" "$anchor"; }
+  run_drought() { local name="$1" id="$2"; shift 2; local ok=1 trace="" alert=0 tip expo expf expa spec rest opt scan mode; dr_reset; total=$((total + 1))
+    for step in "$@"; do IFS=: read -r tip expo expf expa rest <<< "$step"; scan=100000; mode=verified
+      while :; do case "$rest" in scan=*|anchor=*) opt="${rest%%:*}"; rest="${rest#*:}"; case "$opt" in scan=*) scan="${opt#scan=}" ;; anchor=*) mode="${opt#anchor=}" ;; esac ;; *) break ;; esac; done
+      spec="$rest"; dr_call "$id" "$tip" "$spec" "$scan" "$mode"
+      if [ "$DR_FIRE" = "1" ]; then alert=1; elif [ "$DR_OUTCOME" = "ok" ]; then alert=0; fi   # caller wiring under test: only ok clears
       trace="$trace $DR_OUTCOME/$DR_DROUGHT/f$DR_FIRE/a$alert |"; { [ "$DR_OUTCOME" = "$expo" ] && [ "$DR_FIRE" = "$expf" ] && [ "$alert" = "$expa" ]; } || ok=0; done
     if [ "$ok" = "1" ]; then echo "PASS  $name"; else fails=$((fails + 1)); echo "FAIL  $name:$trace"; fi; }
-  run_drought "drought: sighted in the window -> ok, drought counts from the sighting" 29 "4060:ok:0:0:100/4000/1-2-29;101/4040/3-4-5" "4100:ok:0:0:101/4040/3-4-5;102/4080/6-7-8"
-  run_drought "drought: never sighted -> floor is the first window's oldest epoch; fires at 36 epochs of observation; a sighting clears" 29 "4060:ok:0:0:100/4000/1-2-3;101/4040/3-4-5" "5420:ok:0:0:134/5360/1-2-3;135/5400/4-5-6" "5460:drought:1:1:135/5400/4-5-6;136/5440/7-8-9" "5500:ok:0:0:136/5440/7-8-9;137/5480/29-8-9"
-  run_drought "drought: persisted sighting, then no sighting: 35 is ok, 36 fires" 29 "4020:ok:0:0:100/4000/29-2-3" "5420:ok:0:0:134/5360/1-2-3;135/5400/4-5-6" "5460:drought:1:1:136/5440/7-8-9"
-  run_drought "drought: stall (newest mature bundle > 160 blocks behind the tip) neither pages nor clears an active alert" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:136/5440/7-8-9" "5700:stall:0:1:136/5440/7-8-9" "5500:ok:0:0:137/5480/29-8-9"
-  run_drought "drought: malformed output is unknown and touches nothing" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":\"x\",\"height\":1,\"signer_ids\":[1]}]}" "4060:unknown:0:0:raw=garbage" "4060:unknown:0:0:raw=" "4060:ok:0:0:101/4040/3-4-5"
-  run_drought "drought: schema: empty signer_ids, scalar signer_ids, bitmap_valid false, fractional height, height above the tip are all unknown" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"signer_ids\":[]}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"signer_ids\":29}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"signer_ids\":[29],\"bitmap_valid\":false}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040.5,\"signer_ids\":[29]}]}" "4060:unknown:0:0:100/4000/1-2-3;101/4100/4-5-6" "4060:ok:0:0:101/4040/3-4-5"
-  run_drought "drought: regression after a fire is unknown and keeps the alert (OEAE scenario); fires again when the chain passes; a sighting clears" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:136/5440/7-8-9" "5460:unknown:0:1:135/5400/7-8-9" "5500:drought:1:1:137/5480/7-8-9" "5540:ok:0:0:138/5520/29-7-8"
-  DR_SCAN=100 run_drought "drought: coverage gap (tip advanced more than the window) restarts evidence from the new window's oldest epoch" 29 "4020:ok:0:0:100/4000/29-2-3" "4300:unknown:0:0:107/4280/1-2-3" "4340:ok:0:0:107/4280/1-2-3;108/4320/4-5-6"
-  total=$((total + 1)); dr_reset; drought_update x-drought 29 "$(dr_json '100/4000/1-2-3')" 4020 36 160 100000; drought_update x-drought 29 "$(dr_json '100/4000/1-2-3;101/4045/29-2-3')" 4050 36 160 100000; a="$DR_OUTCOME/$DR_LASTSIGNED/$DR_NEWEST"
-  drought_update x-drought 29 "$(dr_json '101/4045/29-2-3')" 4070 36 160 100000; b="$DR_OUTCOME/$DR_LASTSIGNED/$DR_DROUGHT"
-  if [ "$a" = "ok/none/100" ] && [ "$b" = "ok/101/0" ]; then echo "PASS  drought: a bundle fewer than 12 blocks below the tip is not a sighting until it matures"; else fails=$((fails + 1)); echo "FAIL  drought maturity: $a | $b"; fi
-  total=$((total + 1)); dr_reset; drought_update x-drought 29 "$(dr_json '100/4000/29-2-3')" 4020 36 160 100000; NOW=1000 drought_update x-drought 29 "$(dr_json '100/4000/29-2-3')" 4300 36 160 100000; a="$DR_OUTCOME/$DR_STALL_SECONDS"
-  NOW=4700 drought_update x-drought 29 "$(dr_json '100/4000/29-2-3')" 4320 36 160 100000; b="$DR_OUTCOME/$DR_STALL_SECONDS"; NOW=4800 drought_update x-drought 29 "$(dr_json '100/4000/29-2-3;108/4320/1-2-3')" 4340 36 160 100000; c="$DR_OUTCOME/$DR_STALL_SECONDS"
-  if [ "$a" = "stall/0" ] && [ "$b" = "stall/3700" ] && [ "$c" = "ok/0" ]; then echo "PASS  drought: stall duration accrues from its first read (3700 s on the second) and resets on the next read with a recent bundle"; else fails=$((fails + 1)); echo "FAIL  drought stall timing: $a | $b | $c"; fi
+  run_drought "drought: sighted in the window -> ok; the count is bundle epochs observed after the sighting" 29 "4060:ok:0:0:100/4000/1-2-29;101/4040/3-4-5" "4100:ok:0:0:101/4040/3-4-5;102/4080/6-7-8"
+  run_drought "drought: never sighted -> unconfirmed (not ok); fires on the 35th absent bundle epoch; a sighting clears" 29 "4060:unconfirmed:0:0:100-101/auto/1-2-3" "5420:unconfirmed:0:0:102-134/auto/1-2-3" "5460:drought:1:1:135/5400/4-5-6" "5500:ok:0:0:136/5440/29-8-9"
+  run_drought "drought: persisted sighting, then no sighting: 34 absent bundle epochs is ok, 35 fires (completed gap 36)" 29 "4020:ok:0:0:100/4000/29-2-3" "5420:ok:0:0:101-134/auto/1-2-3" "5460:drought:1:1:135/5400/7-8-9"
+  run_drought "drought: bundle epochs are the clock: a window skipping epochs counts only the epochs it shows" 29 "4020:ok:0:0:100/4000/29-2-3" "4420:ok:0:0:105/4200/1-2-3;110/4400/4-5-6"
+  run_drought "drought: a valid empty window (Core's shape) is a stall: neither pages nor clears; the next bundle resumes" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5700:stall:0:1:empty" "5740:stall:0:1:empty" "5780:drought:1:1:136/5760/7-8-9" "5820:ok:0:0:137/5800/29-8-9"
+  run_drought "drought: malformed output is unknown and touches nothing; an immature-only window is unknown" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":\"x\",\"height\":1,\"blockhash\":\"h\",\"signer_ids\":[1]}]}" "4060:unknown:0:0:raw=garbage" "4060:unknown:0:0:raw=" "4010:unknown:0:0:101/4005/3-4-5" "4060:ok:0:0:101/4040/3-4-5"
+  run_drought "drought: schema: empty signer_ids, scalar signer_ids, bitmap_valid false, fractional height, height above the tip, missing blockhash are all unknown" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":[]}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":29}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"blockhash\":\"h\",\"signer_ids\":[29],\"bitmap_valid\":false}]}" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040.5,\"blockhash\":\"h\",\"signer_ids\":[29]}]}" "4060:unknown:0:0:100/4000/1-2-3;101/4100/4-5-6" "4060:unknown:0:0:raw={\"bundles\":[{\"epoch\":101,\"height\":4040,\"signer_ids\":[29]}]}" "4060:ok:0:0:101/4040/3-4-5"
+  run_drought "drought: regression after a fire is unknown and keeps the alert; fires again when the chain passes; a sighting clears" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5460:unknown:0:1:134/5360/7-8-9" "5500:drought:1:1:136/5440/7-8-9" "5540:ok:0:0:137/5480/29-7-8"
+  run_drought "drought: coverage gap after a fire restarts evidence but keeps the alert; in-window reads without our signer are unconfirmed, not ok; a sighting clears (OEAE/HEAE)" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5900:unknown:0:1:scan=100:146/5880/1-2-3" "5940:unconfirmed:0:1:146/5880/1-2-3;147/5920/4-5-6" "5980:ok:0:0:148/5960/29-5-6"
+  run_drought "drought: a sighting whose block is no longer on the active chain is discarded and evidence restarts; the alert stays; unconfirmed until a new sighting" 29 "4020:ok:0:0:100/4000/29-2-3" "5460:drought:1:1:101-135/auto/7-8-9" "5500:unknown:0:1:anchor=reorged:136/5440/7-8-9" "5540:unconfirmed:0:1:137/5480/7-8-9" "5580:ok:0:0:138/5520/29-7-8"
+  run_drought "drought: an unverifiable anchor (getblockhash failed) is unknown and touches nothing" 29 "4020:ok:0:0:100/4000/29-2-3" "4060:unknown:0:0:anchor=none:101/4040/3-4-5" "4100:ok:0:0:101/4040/3-4-5;102/4080/6-7-8"
+  total=$((total + 1)); dr_reset; dr_call 29 4020 "100/4000/1-2-3" 100000 verified; dr_call 29 4050 "100/4000/1-2-3;101/4045/29-2-3" 100000 verified; a="$DR_OUTCOME/$DR_LASTSIGNED/$DR_NEWEST"
+  dr_call 29 4070 "101/4045/29-2-3" 100000 verified; b="$DR_OUTCOME/$DR_LASTSIGNED/$DR_DROUGHT/$(state_get x-drought-last-h "")/$(state_get x-drought-last-hash "")"
+  if [ "$a" = "unconfirmed/none/100" ] && [ "$b" = "ok/101/0/4045/h4045" ]; then echo "PASS  drought: a bundle fewer than 12 blocks below the tip is not a sighting until it matures; the sighting's height and hash are persisted"; else fails=$((fails + 1)); echo "FAIL  drought maturity: $a | $b"; fi
+  total=$((total + 1)); dr_reset; dr_call 29 4020 "100/4000/29-2-3" 100000 verified; NOW=1000 dr_call 29 4300 empty 100000 verified; a="$DR_OUTCOME/$DR_STALL_SECONDS"
+  NOW=4700 dr_call 29 4320 empty 100000 verified; b="$DR_OUTCOME/$DR_STALL_SECONDS"; NOW=4800 dr_call 29 4340 "100/4000/29-2-3;108/4320/1-2-3" 100000 verified; c="$DR_OUTCOME/$DR_STALL_SECONDS/$DR_DROUGHT"
+  if [ "$a" = "stall/0" ] && [ "$b" = "stall/3700" ] && [ "$c" = "ok/0/1" ]; then echo "PASS  drought: stall duration accrues from its first empty read (3700 s on the second) and resets on the next read with a bundle"; else fails=$((fails + 1)); echo "FAIL  drought stall timing: $a | $b | $c"; fi
   fx="$(dirname "$0")/../test/drought-fixtures/getoraclesigners-1000.json"; fxraw=$(jq -c . "$fx" 2>/dev/null || echo garbage)
-  run_drought "drought fixture: slot 3 sighted at the newest mature epoch -> ok 0" 3 "24183636:ok:0:0:raw=$fxraw"
-  run_drought "drought fixture: slot 14 absent -> lower bound 25 from the first window's oldest epoch, ok, and again on the second read" 14 "24183636:ok:0:0:raw=$fxraw" "24183636:ok:0:0:raw=$fxraw"
-  total=$((total + 1)); dr_reset; state_set x-drought-floor 604540; state_set x-drought-last 604550
-  drought_update x-drought 14 "$fxraw" 24183636 36 160 100000; a="$DR_OUTCOME/$DR_DROUGHT/$DR_BASIS"; drought_update x-drought 14 "$fxraw" 24183836 36 160 100000; b="$DR_OUTCOME/$DR_DROUGHT"
-  drought_update x-drought 14 "$fxraw" 24183636 36 160 100000; c="$DR_DROUGHT"
-  if [ "$a" = "drought/40/sighting" ] && [ "$b" = "stall/40" ] && [ "$c" = "40" ]; then echo "PASS  drought fixture: persisted floor 604540 and sighting 604550 -> drought 40 fires; tip+200 -> stall; basis sighting"; else fails=$((fails + 1)); echo "FAIL  drought fixture persisted: $a | $b | $c"; fi
+  run_drought "drought fixture: slot 3 sighted at the newest mature epoch -> ok, count 0" 3 "24183636:ok:0:0:raw=$fxraw"
+  run_drought "drought fixture: slot 14 absent -> 25 bundle epochs observed above the floor, unconfirmed (not ok), and again on the second read" 14 "24183636:unconfirmed:0:0:raw=$fxraw" "24183636:unconfirmed:0:0:raw=$fxraw"
+  total=$((total + 1)); dr_reset; state_set x-drought-floor 604540; state_set x-drought-last 604550; state_set x-drought-last-h 24182000; state_set x-drought-last-hash deadbeef; state_set x-drought-newest 604589; state_set x-drought-tip 24183600; state_set x-drought-count 39
+  drought_update x-drought 14 "$fxraw" 24183636 36 160 100000 deadbeef; a="$DR_OUTCOME/$DR_DROUGHT/$DR_BASIS"; drought_update x-drought 14 "$fxraw" 24183836 36 160 100000 deadbeef; b="$DR_OUTCOME/$DR_DROUGHT"
+  if [ "$a" = "drought/40/sighting" ] && [ "$b" = "stall/40" ]; then echo "PASS  drought fixture: persisted sighting (anchored) with 39 absent epochs + the fixture's newest epoch -> 40, fires; tip+200 with a wide scan -> stall by distance"; else fails=$((fails + 1)); echo "FAIL  drought fixture persisted: $a | $b"; fi
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 

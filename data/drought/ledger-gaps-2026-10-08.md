@@ -20,8 +20,11 @@ ledger reproduces Core's `signer_ids` for every bundle of a 1000-block `getoracl
 - **Signer set of an epoch**: the union of the signer slots of that epoch's bundles. Every one of
   the 10,476 bundle epochs has exactly 7 signers, so bundles within an epoch repeat one signing.
 - **Gap**: for one slot, the number of bundle epochs from one epoch in which it signed to the next
-  epoch in which it signed. The clock is bundle epochs, which is the clock the monitor uses; epochs
-  with no bundle do not advance it. Raw-epoch gaps are a little longer (about 5 percent).
+  epoch in which it signed (a completed gap of 36 has 35 bundle epochs in which the slot was absent).
+  The clock is bundle epochs, and so is the monitor's: it keeps a count of distinct bundle epochs
+  observed since the last sighting and fires when that count reaches 35, which is the point at which
+  the completed gap can no longer be shorter than 36. Epochs with no bundle advance neither. Raw-epoch
+  gaps are a little longer (about 5 percent).
 - **Signing rate**: a slot's signed epochs divided by all bundle epochs.
 - **Healthy slot (eligibility)**: rate >= 0.21. With 7 of 35 chosen per epoch a slot that never
   missed would sign 0.20 of epochs if every slot were eligible every epoch; slots that were absent
@@ -50,7 +53,10 @@ ledger reproduces Core's `signer_ids` for every bundle of a 1000-block `getoracl
 Below 30 the observed tail is lighter than the model (healthy slots are slightly more likely to be
 chosen than 1 in 5 because some slots are absent). At 36 to 47 the observed count (18) is close to
 what the model expects for a lottery tail (about 20 of 51,806). At 48 and above, 20 gaps are
-observed where the model expects 1.5, so that band is outages, not lottery.
+observed where the model expects 1.5; the model does not account for that band. The model's
+assumption, independent and equal-probability selection each epoch, is consistent with the similar
+marginal rates of the 22 slots but is not established by them: similar rates would also arise from
+selection that is correlated across epochs or across slots.
 
 ## The 38 healthy gaps of 36 or more, labeled by date
 
@@ -70,17 +76,19 @@ observed where the model expects 1.5, so that band is outages, not lottery.
   (37), slot 18 Aug 21 (36), slot 21 Jul 24 (38) and Jul 27 (38), slot 22 Aug 23 (39), slot 25
   Jul 30 (36), slot 28 Jul 31 (40) and Sep 5 (39), slot 33 Aug 20 (44). Thirteen gaps.
 
-So of the 38, 25 are attributable to dated or paired events or are too long for the lottery, and
-13 are single-slot 36 to 47 gaps that the lottery model would produce at about this rate.
+So of the 38, 20 coincide with a dated or paired event, 5 more are single-slot gaps the model puts
+below 3 in 100,000 each and have no recorded cause, and 13 are single-slot 36 to 47 gaps that the
+lottery model would produce at about this rate. An unlikely gap is not a confirmed outage; the
+labels above record coincidence with events, not verified causes.
 
 ## What this does and does not establish
 
-- A threshold of 36 bundle epochs pages a healthy slot about as often as the lottery tail
-  predicts: 0.041% of gaps under the model, 0.073% observed including unlabeled gaps. At about
-  29 signings per slot per day, the model is one false page per slot per 85 days; the observed
-  rate including the 13 unlabeled gaps is about one per 48 days. Both are provisional: the model's
-  independence assumption is supported by the rates, not proven, and 75 days of one network's
-  history is the whole sample.
+- A threshold of 36 bundle epochs (the monitor fires on the 35th absent bundle epoch) pages a
+  healthy slot about as often as the lottery tail predicts: 0.041% of gaps under the model, 0.073%
+  observed including unlabeled gaps. At about 29 signings per slot per day, the model is one false
+  page per slot per 85 days; the observed rate including the 13 unlabeled gaps is about one per 48
+  days. Both are provisional: the model's independence assumption is consistent with the rates, not
+  established by them, and 75 days of one network's history is the whole sample.
 - A drought is **absent participation on this node's chain**, not proof of a silent price path.
   The one silent-price case in the sample (slot 29, Oct 1 to 6) shows as a drought for its whole
   duration, which is one case.

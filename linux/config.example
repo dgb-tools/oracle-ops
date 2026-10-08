@@ -47,8 +47,8 @@ NETVIEW_STALE_SECONDS=3600
 FORK_GAP_BLOCKS=100       # a peer "claims ahead" when its startingheight exceeds our headers by more than this
 FORK_MIN_PEERS=2          # this many peers must claim ahead at once (one erroneous peer cannot set the maximum)
 FORK_PROGRESS_BLOCKS=100  # headers advancing by at least this per cycle is a catch-up, not a stall
-# Signing drought (chain-based, local getoraclesigners; the kit's authoritative silent-slot check):
-DROUGHT_EPOCHS=36          # epochs without our slot in any bundle before paging (~1 false page per 85 days per slot at the lottery floor)
+# Signing drought (chain-participation evidence from local getoraclesigners; thresholds provisional, see runbook):
+DROUGHT_EPOCHS=36          # completed-gap threshold from the ledger packet; the monitor fires on the 35th absent bundle epoch
 DROUGHT_SCAN_BLOCKS=100    # getoraclesigners window (Core's default; the scan walks every block under cs_main); sightings persist across runs
 DROUGHT_STALL_BLOCKS=160   # newest mature bundle more than this behind the tip = no recent bundle on this node's chain (no page, no clear)
 DROUGHT_STALL_WARN_SECONDS=3600  # a stall older than this raises the degraded-observation warning
