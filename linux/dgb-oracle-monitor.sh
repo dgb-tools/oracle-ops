@@ -160,12 +160,17 @@ netview_validate() {
 }
 
 # Network-view state machine (pure except for the state files). Rules, per crew review 2026-10-06/07.
-# Outcomes (NV_OUTCOME): miss | hit | outofscope | unknown
-#  miss       = read ok, heartbeat fresh, last_update is the explicit 0 "never received" sentinel (missing or
-#               null is a schema failure that never reaches this machine) or
-#               older than $5 seconds. Pending evidence accrues.
-#  hit        = read ok, heartbeat fresh, last_update within $5 seconds: CONFIRMED recovery; clears
+# Outcomes (NV_OUTCOME): miss | hit | zeroed | outofscope | unknown   (crew ruling 2026-10-08, option A)
+#  miss       = read ok, heartbeat fresh, last_update > 0 and older than $5 seconds ("aged"): the observer
+#               reports an old price timestamp. Pending evidence accrues. This is an observation, not proven
+#               silence; on this observer it was seen on 0 of 35 slots in every read of 2026-10-08's samples.
+#  hit        = read ok, heartbeat fresh, last_update > 0 and within $5 seconds: CONFIRMED recovery; clears
 #               pending evidence and is the only outcome that may clear an active alert.
+#  zeroed     = read ok, heartbeat fresh, last_update is the explicit 0 (missing or null is a schema failure
+#               that never reaches this machine). The observer zeroes a slot whenever no price message has
+#               arrived since its last pending-message clear (every ~14 s), while slots send every 60-250 s:
+#               a healthy slot read 0 on 15-52% of reads on 2026-10-08, with runs of 9 minutes. Logged only.
+#               Pending evidence reset; alert untouched. NEVER a miss, NEVER a hit.
 #  outofscope = read ok but heartbeat not fresh (node down, restarting, loading): says nothing about the
 #               price path. Pending evidence reset; alert state untouched.
 #  unknown    = read not ok, or last_update malformed or in the future (> now + 300 s): pending evidence
@@ -178,10 +183,12 @@ netview_update() {
   streak=$(state_get net-miss 0); since=$(state_get net-miss-since "$now")
   NV_OUTCOME=unknown; NV_FIRE=0; NV_STREAK=0; NV_AGE=-1; NV_MINUTES=0
   if [ "$readok" != "1" ]; then state_set net-miss 0; return 0; fi
-  # last_update: "" / null / 0 = never received (sentinel); non-integer or future = malformed -> unknown
+  # last_update: explicit 0 = zeroed (handled after the heartbeat check); "" / null = malformed -> unknown;
+  # non-integer or future = malformed -> unknown
   case "$lu" in 0) NV_AGE=-1 ;; ''|null|*[!0-9]*) state_set net-miss 0; return 0 ;; *) NV_AGE=$((now - lu)); if [ "$NV_AGE" -lt -300 ]; then state_set net-miss 0; return 0; fi; [ "$NV_AGE" -lt 0 ] && NV_AGE=0 ;; esac
   if [ "$hb" != "fresh" ]; then NV_OUTCOME=outofscope; state_set net-miss 0; return 0; fi
-  if [ "$NV_AGE" -lt 0 ] || [ "$NV_AGE" -gt "$stale" ]; then NV_OUTCOME=miss; else NV_OUTCOME=hit; fi
+  if [ "$NV_AGE" -lt 0 ]; then NV_OUTCOME=zeroed; state_set net-miss 0; return 0; fi
+  if [ "$NV_AGE" -gt "$stale" ]; then NV_OUTCOME=miss; else NV_OUTCOME=hit; fi
   if [ "$NV_OUTCOME" = "miss" ]; then [ "$streak" = "0" ] && since=$now; streak=$((streak + 1)); else streak=0; since=$now; fi
   state_set net-miss "$streak"; state_set net-miss-since "$since"; state_set net-last-ok-read "$now"
   NV_STREAK=$streak; NV_MINUTES=$(( (now - since) / 60 ))
@@ -372,10 +379,11 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
         miss|hit)
           local netok=1; [ "$NV_FIRE" = "1" ] && netok=0
           if [ "$NV_OUTCOME" = "hit" ] || [ "$NV_FIRE" = "1" ]; then   # a miss that is not yet firing makes no call, so an active alert stands
-          report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
-            "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
+          report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID: NETWORK-VIEW OBSERVER REPORTS AN OLD PRICE TIMESTAMP" \
+            "The observer at $NETVIEW_URL holds a last price timestamp for slot $ORACLE_ID that is ${NV_AGE}s old (older than $NETVIEW_STALE_SECONDS s) with a fresh heartbeat (status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) on $NV_STREAK consecutive reads over $NV_MINUTES minutes, while this node reports ${detail}. This is an observation from one node we do not run, not proven silence; on this observer the condition was seen on no slot in the samples of 2026-10-08, so treat it as rare and corroborate: your own listoracle, the oracle log for price messages, a second observer, and the signing-drought check. Cycling the oracle needs that corroboration, not this alert alone." urgent
           fi
           summary="$summary net-o$ORACLE_ID=$NV_OUTCOME/lu${NV_AGE}s" ;;
+        zeroed) summary="$summary net-o$ORACLE_ID=zeroed"; log "netview: observer shows last_update 0 for slot $ORACLE_ID (not in its current scan; a healthy slot reads 0 on 15-52% of reads); logged only, pending evidence reset, alert state untouched" ;;
         outofscope) summary="$summary net-o$ORACLE_ID=hb-$nhb"; log "netview: heartbeat $nhb at the observer; price path not assessed, alert state untouched" ;;
         *) if [ "$nvalid" != "ok" ]; then log "netview check unknown (pending evidence reset, alert state untouched): roster failed schema/completeness check from $NETVIEW_URL"
            elif [ -z "$nme" ]; then log "netview check unknown: slot $ORACLE_ID absent; configuration or response completeness unconfirmed ($NETVIEW_URL)"
@@ -415,7 +423,9 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case "fourth stale read at 15 min fires" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1
   run_case "unknown ticks reset pending evidence and never fire (OEAE scenario)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 0::0:600:0:0 0::0:900:0:0 1:fresh:5500:1500:0:0 1:fresh:5800:1800:0:0 1:fresh:6100:2100:0:0 1:fresh:6400:2400:1:1
   run_case "stale heartbeat with stale last_update is out of scope, not a miss" 1:stale:9000:0:0:0 1:stale:9300:300:0:0 1:stale:9600:600:0:0 1:stale:9900:900:0:0
-  run_case "never-received sentinel (explicit 0) with fresh heartbeat counts as stale" 1:fresh:zero:0:0:0 1:fresh:zero:300:0:0 1:fresh:zero:600:0:0 1:fresh:zero:900:1:1
+  run_case "explicit 0 with a fresh heartbeat is zeroed: logged only, never fires" 1:fresh:zero:0:0:0 1:fresh:zero:300:0:0 1:fresh:zero:600:0:0 1:fresh:zero:900:0:0 1:fresh:zero:1200:0:0 1:fresh:zero:1500:0:0
+  run_case "zeroed resets pending aged evidence (the streak restarts after it)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:zero:600:0:0 1:fresh:4900:900:0:0 1:fresh:5200:1200:0:0 1:fresh:5500:1500:0:0 1:fresh:5800:1800:1:1
+  run_case "an active aged alert survives zeroed reads (never clears)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:zero:1200:0:1 1:fresh:zero:1500:0:1 1:fresh:zero:1800:0:1
   run_case "empty last_update reaching the state machine is unknown, never a miss" 1:fresh:none:0:0:0 1:fresh:none:300:0:0 1:fresh:none:600:0:0 1:fresh:none:900:0:0
   run_case "a hit clears pending evidence" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:50:600:0:0 1:fresh:4000:900:0:0 1:fresh:4300:1200:0:0 1:fresh:4600:1500:0:0
   run_case "active alert survives unknown reads (unconfirmed, not recovered)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 0::0:1200:0:1 0::0:1500:0:1

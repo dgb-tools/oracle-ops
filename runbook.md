@@ -95,31 +95,50 @@ node's self-view cannot see this failure; a node you do not run can see what you
    consecutive rounds, with slot 29 itself "reporting" in 7 of the 12 while signing normally. `last_update` is the last price the
    observer received from your slot: in the 35-of-35 read above every slot read between 45
    seconds and 11 minutes; during slot 29's silence it read 0 for days while the heartbeat
-   stayed `fresh`. Those are the observations the thresholds rest on, not a general bound.
-3. The failure signature is therefore: heartbeat `fresh` **and** `last_update` older than an
-   hour (or 0, which the RPC help describes as the timestamp of the last price and which read
-   0 throughout slot 29's silence), on three reads spanning at least fifteen minutes. One stale
-   read is not a signal.
-4. Corroborate before acting: read the roster again in fifteen minutes and check your own
-   `listoracle`. If the signature holds, cycle the oracle: `stoporacle N`, then `startoracle N`
-   (wallet unlocked). On slot 29 the observer showed a fresh `last_update` within two minutes
-   and the next signed bundle included the slot four minutes later.
+   stayed `fresh`. **But 0 is not a silence signal on its own.** Measured on 2026-10-08 (two
+   raw series, 30-second and 60-second reads, in `data/observer-samples/`): the observer sets a
+   slot's `last_update` to 0 whenever no price message has arrived since its own last
+   pending-message clear, which happens every 14 seconds or so, while slots send a price every
+   60 to 250 seconds. A healthy slot therefore reads 0 on 15 to 52 percent of reads (slot 29:
+   42 percent), consecutive reads cluster, and healthy slots showed runs of 0 lasting 9 minutes
+   at one-minute reads and 20 minutes at five-minute reads. Three five-minute reads at 0 is a
+   coin flip, and a replay of that rule paged 14 of 34 healthy slots within one hour.
+3. What the observer can tell you is therefore limited. `last_update` **greater than 0 and
+   older than an hour** with a fresh heartbeat ("aged") would be an old price timestamp the
+   observer still holds; it was seen on no slot in either sample, so it is rare and its
+   diagnostic meaning is unvalidated. `last_update` **0 on every read for a long time** while
+   other slots keep refilling around it is what slot 29's silence looked like (days), but how
+   long "long" must be before it is more than landing noise has not been sized yet; sustained
+   zeroing can prompt investigation, not action.
+4. Corroborate before acting, from sources that are not this observer: your own `listoracle`,
+   the oracle log for price and nonce messages, the signing-drought check (your slot's
+   appearances in bundles on your own chain), and a second observer if you have one. Cycling
+   the oracle (`stoporacle N`, then `startoracle N`, wallet unlocked) needs that corroboration,
+   not an observer reading. On slot 29, after the cycle, the observer showed a fresh
+   `last_update` within two minutes and the next signed bundle included the slot four minutes
+   later.
 
 Two v9.26.6 behaviors that will show up and are not understood as failures:
 
 - `Oracle: Manually cleared all pending messages and attestations` in `debug.log` every one or
-  two blocks, on every node observed so far. It coincides with the per-round reset. Its full
-  meaning has not been confirmed from source; it has not been associated with any failure.
+  two blocks, on every node observed so far (on the 9.26.7 oracle box: 48 clears in 15 minutes,
+  median 14 seconds apart, about 0.66 per block). Its meaning has not been confirmed from
+  source and it has not been associated with any failure; its effect on an observer's roster
+  is measured: a slot reads `last_update` 0 until its next price message arrives after the
+  observer's own clear.
 - A "reporting" count that churns from read to read (9, then 35, then 17 within minutes on one
   node). It is a per-round sample, not a network health number. Heartbeats are the stable
   availability signal; price receipts per slot are read from `last_update`.
 
-The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`
-in the config): a miss is a successful read with a fresh heartbeat and a stale `last_update`;
-the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
-fetch, a non-JSON body or an incomplete roster is never a miss and can never fire or clear an
-alert: pending evidence is reset and any active alert is left standing until a good read. The alert
-asks you to corroborate; it does not tell you to cycle on the first read.
+The monitors in this kit include this check (`network_view_url`, `network_view_stale_seconds`
+in the config), bounded as the crew ruled on 2026-10-08: a miss is a successful read with a
+fresh heartbeat and a `last_update` greater than 0 and older than an hour ("aged"); the alert
+fires after three consecutive misses spanning at least fifteen minutes and reads "observer
+reports an old price timestamp"; an explicit 0 is `zeroed`, logged only, and can neither page
+nor clear; a failed fetch, a non-JSON body or an incomplete roster is never a miss and can
+never fire or clear an alert. Pending evidence is reset by zeroed, unknown and out-of-scope
+reads; an active alert stands until a read with a fresh heartbeat and a recent positive
+timestamp. The alert asks you to corroborate; it does not tell you to cycle.
 
 ## "headers == blocks" is not "synced" when peers are far ahead (testnet fork, Sep–Oct 2026)
 

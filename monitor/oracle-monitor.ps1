@@ -214,11 +214,17 @@ function Test-NetViewRoster($Roster) {
   return $true
 }
 
-# Network-view state machine (pure; no I/O). Rules, per crew review 2026-10-06/07. Outcomes:
-#  miss       = read ok, heartbeat 'fresh', last_update is the never-received sentinel (0/null) or older than
-#               $StaleSeconds. Pending evidence accrues.
-#  hit        = read ok, heartbeat 'fresh', last_update within $StaleSeconds: CONFIRMED recovery; clears pending
-#               evidence; the only outcome allowed to clear an active alert.
+# Network-view state machine (pure; no I/O). Rules per crew review 2026-10-06/07 and option A, 2026-10-08. Outcomes:
+#  miss       = read ok, heartbeat 'fresh', last_update > 0 and older than $StaleSeconds ("aged"): the observer
+#               reports an old price timestamp. Pending evidence accrues. An observation, not proven silence; on
+#               this observer it was seen on 0 of 35 slots in every read of 2026-10-08's samples.
+#  hit        = read ok, heartbeat 'fresh', last_update > 0 and within $StaleSeconds: CONFIRMED recovery; clears
+#               pending evidence; the only outcome allowed to clear an active alert.
+#  zeroed     = read ok, heartbeat 'fresh', last_update is the explicit 0 (null/missing is a schema failure that
+#               never reaches this machine). The observer zeroes a slot whenever no price message has arrived since
+#               its last pending-message clear (every ~14 s) while slots send every 60-250 s: a healthy slot read 0
+#               on 15-52% of reads on 2026-10-08, with runs of 9 minutes. Logged only. Pending evidence reset; alert
+#               untouched. NEVER a miss, NEVER a hit.
 #  outofscope = read ok but heartbeat not fresh (node down/restarting/loading): nothing known about the price
 #               path. Pending evidence reset; alert untouched.
 #  unknown    = read not ok, or last_update malformed or in the future (> now + 300 s). Pending evidence reset;
@@ -237,7 +243,8 @@ function Update-NetViewState([hashtable]$St, [bool]$ReadOk, $Entry, [int64]$NowU
     $age = $NowU - $luN; if ($age -lt -300) { $St['net-miss'] = 0; return $res }; if ($age -lt 0) { $age = 0 }
   }
   if ($Entry.heartbeat_status -ne 'fresh') { $St['net-miss'] = 0; $res.outcome = 'outofscope'; $res.age = $age; return $res }
-  $miss = ($age -lt 0) -or ($age -gt $StaleSeconds)
+  if ($age -lt 0) { $St['net-miss'] = 0; $res.outcome = 'zeroed'; $res.age = -1; return $res }
+  $miss = ($age -gt $StaleSeconds)
   if ($miss) { if ($streak -eq 0) { $since = $NowU }; $streak = $streak + 1 } else { $streak = 0; $since = $NowU }
   $St['net-miss'] = $streak; $St['net-miss-since'] = $since; $St['net-last-ok-read'] = $NowU
   $res.outcome = $(if ($miss) { 'miss' } else { 'hit' }); $res.streak = $streak; $res.age = $age
@@ -387,16 +394,16 @@ function Check-Chain([string]$Label, [string[]]$Net, [string]$ProcPattern, [bool
         'miss' {
           if ($r.fire) {
             $localStatus = 'missing'; if ($me) { $localStatus = $me.status }
-            Report-Check "$Label-oracle$OracleId-networkview" $false "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" `
-              ("The observer at $NetViewUrl has not received a price from slot $OracleId for $($r.age) seconds " +
-               "(heartbeat $($nme.heartbeat_status), status $($nme.status), price_source $($nme.price_source)) across $($r.streak) consecutive reads over $($r.minutes) minutes, " +
-               "while this node reports status=$localStatus. This is one observer's view, not network proof. Corroborate first: " +
-               "read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, " +
-               "the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix.") 'urgent'
+            Report-Check "$Label-oracle$OracleId-networkview" $false "DGB ORACLE $OracleId`: NETWORK-VIEW OBSERVER REPORTS AN OLD PRICE TIMESTAMP" `
+              ("The observer at $NetViewUrl holds a last price timestamp for slot $OracleId that is $($r.age) seconds old (older than $NetViewStaleSeconds s) with a fresh heartbeat " +
+               "(status $($nme.status), price_source $($nme.price_source)) on $($r.streak) consecutive reads over $($r.minutes) minutes, while this node reports status=$localStatus. " +
+               "This is an observation from one node we do not run, not proven silence; on this observer the condition was seen on no slot in the samples of 2026-10-08, so treat it as rare and corroborate: " +
+               "your own listoracle, the oracle log for price messages, a second observer, and the signing-drought check. Cycling the oracle needs that corroboration, not this alert alone.") 'urgent'
           }
           $summary += " net-o$OracleId=miss/lu$($r.age)s"
         }
-        'hit' { Report-Check "$Label-oracle$OracleId-networkview" $true "DGB ORACLE $OracleId NOT OBSERVED BY THE NETWORK-VIEW NODE" 'confirmed recovery' 'urgent'; $summary += " net-o$OracleId=hit/lu$($r.age)s" }
+        'hit' { Report-Check "$Label-oracle$OracleId-networkview" $true "DGB ORACLE $OracleId`: NETWORK-VIEW OBSERVER REPORTS AN OLD PRICE TIMESTAMP" 'confirmed recovery' 'urgent'; $summary += " net-o$OracleId=hit/lu$($r.age)s" }
+        'zeroed' { $summary += " net-o$OracleId=zeroed"; Log "netview: observer shows last_update 0 for slot $OracleId (not in its current scan; a healthy slot reads 0 on 15-52% of reads); logged only, pending evidence reset, alert state untouched" }
         'outofscope' { $summary += " net-o$OracleId=hb-$($nme.heartbeat_status)"; Log "netview: heartbeat $($nme.heartbeat_status) at the observer; price path not assessed, alert state untouched" }
         default { Log "netview check unknown (pending evidence reset, alert state untouched): $(if ($why) { $why } else { 'last_update malformed or in the future' })" }
       }
@@ -416,7 +423,9 @@ if ($NetViewSelfTest) {
     @{ name = 'fourth stale read at 15 min fires'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1)) },
     @{ name = 'unknown ticks reset pending evidence and never fire (OEAE scenario)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($false,'',0,600,$false,0), @($false,'',0,900,$false,0), @($true,'fresh',5500,1500,$false,0), @($true,'fresh',5800,1800,$false,0), @($true,'fresh',6100,2100,$false,0), @($true,'fresh',6400,2400,$true,1)) },
     @{ name = 'stale heartbeat with stale last_update is out of scope, not a miss'; steps = @(@($true,'stale',9000,0,$false,0), @($true,'stale',9300,300,$false,0), @($true,'stale',9600,600,$false,0), @($true,'stale',9900,900,$false,0)) },
-    @{ name = 'never-received sentinel (explicit 0) with fresh heartbeat counts as stale'; steps = @(@($true,'fresh','zero',0,$false,0), @($true,'fresh','zero',300,$false,0), @($true,'fresh','zero',600,$false,0), @($true,'fresh','zero',900,$true,1)) },
+    @{ name = 'explicit 0 with a fresh heartbeat is zeroed: logged only, never fires'; steps = @(@($true,'fresh','zero',0,$false,0), @($true,'fresh','zero',300,$false,0), @($true,'fresh','zero',600,$false,0), @($true,'fresh','zero',900,$false,0), @($true,'fresh','zero',1200,$false,0), @($true,'fresh','zero',1500,$false,0)) },
+    @{ name = 'zeroed resets pending aged evidence (the streak restarts after it)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh','zero',600,$false,0), @($true,'fresh',4900,900,$false,0), @($true,'fresh',5200,1200,$false,0), @($true,'fresh',5500,1500,$false,0), @($true,'fresh',5800,1800,$true,1)) },
+    @{ name = 'an active aged alert survives zeroed reads (never clears)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($true,'fresh','zero',1200,$false,1), @($true,'fresh','zero',1500,$false,1), @($true,'fresh','zero',1800,$false,1)) },
     @{ name = 'null last_update reaching the state machine is unknown, never a miss'; steps = @(@($true,'fresh','none',0,$false,0), @($true,'fresh','none',300,$false,0), @($true,'fresh','none',600,$false,0), @($true,'fresh','none',900,$false,0)) },
     @{ name = 'a hit clears pending evidence'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',50,600,$false,0), @($true,'fresh',4000,900,$false,0), @($true,'fresh',4300,1200,$false,0), @($true,'fresh',4600,1500,$false,0)) },
     @{ name = 'active alert survives unknown reads (unconfirmed, not recovered)'; steps = @(@($true,'fresh',4000,0,$false,0), @($true,'fresh',4300,300,$false,0), @($true,'fresh',4600,600,$false,0), @($true,'fresh',4900,900,$true,1), @($false,'',0,1200,$false,1), @($false,'',0,1500,$false,1)) },
