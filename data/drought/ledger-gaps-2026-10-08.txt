@@ -1,0 +1,51 @@
+blocks 440853 (23869440..24310292); raw epochs 11022; bundle epochs 10476; invalid bundles skipped 0
+signers per bundle epoch: {7: 10476}
+per-slot signing rate: 0:0.21 1:0.13 2:0.23 3:0.21 4:0.18 5:0.20 6:0.22 7:0.22 8:0.23 9:0.23 10:0.23 11:0.17 12:0.23 13:0.13 14:0.16 15:0.11 16:0.23 17:0.23 18:0.23 19:0.23 20:0.23 21:0.22 22:0.23 23:0.21 24:0.12 25:0.23 26:0.23 27:0.11 28:0.22 29:0.22 30:0.14 31:0.21 32:0.17 33:0.23 34:0.23
+healthy (rate >= 0.21): [0, 2, 6, 7, 8, 9, 10, 12, 16, 17, 18, 19, 20, 21, 22, 25, 26, 28, 29, 31, 33, 34]; excluded: [(1, 0.13), (3, 0.21), (4, 0.18), (5, 0.2), (11, 0.17), (13, 0.13), (14, 0.16), (15, 0.11), (23, 0.21), (24, 0.12), (27, 0.11), (30, 0.14), (32, 0.17)]
+healthy gaps: n=51806 median 3.0 p90 9 p99 19 max 390
+  gaps >= 18 ( 3.0 h at one epoch per 10 min): observed 1.315% (681), geometric model 2.252%
+  gaps >= 24 ( 4.0 h at one epoch per 10 min): observed 0.322% (167), geometric model 0.590%
+  gaps >= 30 ( 5.0 h at one epoch per 10 min): observed 0.129% (67), geometric model 0.155%
+  gaps >= 36 ( 6.0 h at one epoch per 10 min): observed 0.073% (38), geometric model 0.041%
+  gaps >= 48 ( 8.0 h at one epoch per 10 min): observed 0.039% (20), geometric model 0.003%
+  gaps >= 60 (10.0 h at one epoch per 10 min): observed 0.035% (18), geometric model 0.000%
+healthy gaps >= 36 (label by date):
+  slot  0:   37 bundle epochs  2026-07-28 07:05Z -> 2026-07-28 13:14Z
+  slot  0:   70 bundle epochs  2026-08-27 04:21Z -> 2026-08-27 16:06Z
+  slot  7:   73 bundle epochs  2026-08-06 08:57Z -> 2026-08-06 23:42Z
+  slot  7:   85 bundle epochs  2026-08-14 08:49Z -> 2026-08-14 22:55Z
+  slot  7:   39 bundle epochs  2026-09-10 21:20Z -> 2026-09-11 03:48Z
+  slot  7:   42 bundle epochs  2026-09-19 19:28Z -> 2026-09-20 02:48Z
+  slot  8:  266 bundle epochs  2026-08-20 06:19Z -> 2026-08-22 03:07Z
+  slot  8:   39 bundle epochs  2026-09-26 20:16Z -> 2026-09-27 02:42Z
+  slot  9:   38 bundle epochs  2026-08-01 01:34Z -> 2026-08-01 07:51Z
+  slot 10:   89 bundle epochs  2026-07-18 05:15Z -> 2026-07-19 01:41Z
+  slot 12:   40 bundle epochs  2026-08-07 07:04Z -> 2026-08-07 15:06Z
+  slot 12:   73 bundle epochs  2026-09-29 07:47Z -> 2026-09-30 01:57Z
+  slot 16:   53 bundle epochs  2026-08-19 03:42Z -> 2026-08-19 12:41Z
+  slot 17:   37 bundle epochs  2026-08-19 08:42Z -> 2026-08-19 14:53Z
+  slot 18:   36 bundle epochs  2026-08-21 06:00Z -> 2026-08-21 11:55Z
+  slot 20:   69 bundle epochs  2026-08-06 09:21Z -> 2026-08-06 23:07Z
+  slot 20:   85 bundle epochs  2026-08-14 08:38Z -> 2026-08-14 22:49Z
+  slot 20:   36 bundle epochs  2026-09-10 21:10Z -> 2026-09-11 03:10Z
+  slot 20:   39 bundle epochs  2026-09-19 19:28Z -> 2026-09-20 02:16Z
+  slot 21:   38 bundle epochs  2026-07-24 12:47Z -> 2026-07-24 20:48Z
+  slot 21:   38 bundle epochs  2026-07-27 01:05Z -> 2026-07-27 07:48Z
+  slot 21:  390 bundle epochs  2026-08-11 22:33Z -> 2026-08-14 15:27Z
+  slot 21:   98 bundle epochs  2026-09-15 01:08Z -> 2026-09-15 18:28Z
+  slot 22:   39 bundle epochs  2026-08-23 06:01Z -> 2026-08-23 12:29Z
+  slot 25:   36 bundle epochs  2026-07-30 04:41Z -> 2026-07-30 10:41Z
+  slot 25:  227 bundle epochs  2026-08-27 04:29Z -> 2026-08-28 18:22Z
+  slot 28:   40 bundle epochs  2026-07-31 06:50Z -> 2026-07-31 13:33Z
+  slot 28:   65 bundle epochs  2026-08-27 04:12Z -> 2026-08-27 15:11Z
+  slot 28:   39 bundle epochs  2026-09-05 17:39Z -> 2026-09-06 00:12Z
+  slot 29:   39 bundle epochs  2026-07-18 05:15Z -> 2026-07-18 14:23Z
+  slot 29:   62 bundle epochs  2026-08-27 04:12Z -> 2026-08-27 14:38Z
+  slot 31:   67 bundle epochs  2026-07-22 02:40Z -> 2026-07-22 14:26Z
+  slot 31:  327 bundle epochs  2026-07-22 14:42Z -> 2026-07-25 03:01Z
+  slot 31:   48 bundle epochs  2026-07-27 17:33Z -> 2026-07-28 02:16Z
+  slot 33:   44 bundle epochs  2026-08-20 20:41Z -> 2026-08-21 03:56Z
+  slot 34:   77 bundle epochs  2026-07-29 06:35Z -> 2026-07-29 19:24Z
+  slot 34:   90 bundle epochs  2026-08-27 02:30Z -> 2026-08-27 17:39Z
+  slot 34:   79 bundle epochs  2026-09-11 04:39Z -> 2026-09-11 18:58Z
+longest bundle-less stretches (raw epochs, after): [(5, '2026-07-19 03:13Z'), (4, '2026-09-29 14:28Z'), (4, '2026-07-26 18:47Z'), (3, '2026-09-29 10:34Z'), (3, '2026-09-22 17:39Z'), (3, '2026-09-20 10:44Z')]

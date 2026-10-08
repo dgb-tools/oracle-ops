@@ -22,7 +22,8 @@
   "fork_min_peers": 2,
   "fork_progress_blocks": 100,
   "drought_epochs": 36,
-  "drought_scan_blocks": 400,
+  "drought_scan_blocks": 100,
   "drought_stall_blocks": 160,
-  "drought_testnet": false
+  "drought_testnet": false,
+  "drought_stall_warn_seconds": 3600
 }

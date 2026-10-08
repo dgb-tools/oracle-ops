@@ -140,37 +140,59 @@ never fire or clear an alert. Pending evidence is reset by zeroed, unknown and o
 reads; an active alert stands until a read with a fresh heartbeat and a recent positive
 timestamp. The alert asks you to corroborate; it does not tell you to cycle.
 
-## Signing drought: the chain's own record of your slot (2026-10-08)
+## Signing drought: chain-participation evidence for your slot (2026-10-08)
 
 Every oracle bundle names exactly seven signers, chosen by a lottery among the oracles that
-submitted nonces for that epoch. A healthy slot therefore signs about one epoch in five, and
-a slot whose price path is silent never signs. That makes the chain itself a silent-slot
-detector that needs no outside observer. From the participation ledger (10,476 bundle epochs,
+submitted nonces for that epoch. A healthy slot therefore signs about one epoch in five. In
+the one silent-price case the ledger shows (slot 29, October 1 to 6), the slot did not sign for
+the whole period. That makes the chain a record of participation that needs no outside
+observer, with limits stated below. From the participation ledger (10,476 bundle epochs,
 July 18 to October 1, 2026; the 22 slots with a normal signing rate; 51,806 gaps between
 consecutive signings): the median gap is 3 epochs and the 99th percentile 19. Gaps of 36 or
-more epochs are 0.073% of healthy gaps observed and 0.041% under the pure-lottery model, which
-is about one false page per 85 days per slot; every gap longer than that in the data lines up
-with a known outage (the August 27 crash; one operator's two slots going dark together four
-times). Slot 29's own silence of October 1 to 6 would have paged six hours in.
+more epochs were 0.073% of healthy gaps observed, against 0.041% under a model of
+independent, equal-probability selection per epoch, and every gap longer than that lines up
+with a known outage. The calculation, its gap definition, the eligibility rule and the outage
+labels are in `data/drought/ledger-gaps-2026-10-08.md`; the script that produced them is
+`scripts/drought-gaps.py`. The independence assumption is supported by the per-slot rates
+(0.21 to 0.23 for the 22 slots), not proven.
 
-Both monitors now run this check (`drought_epochs` 36, `drought_scan_blocks` 400,
-`drought_stall_blocks` 160; mainnet by default, `drought_testnet` to enable it there, since
-the numbers above are mainnet's). Rule: our slot absent from every bundle for 36 epochs while
-bundles keep landing pages at normal priority. Two things to know:
+Both monitors run this check (`drought_epochs` 36, `drought_scan_blocks` 100,
+`drought_stall_blocks` 160, `drought_stall_warn_seconds` 3600; mainnet by default,
+`drought_testnet` to enable it there, since the numbers are mainnet's). Rule: your slot absent
+from every mature bundle on your node's chain for 36 epochs while bundles keep landing pages at
+normal priority. **36 and 160 are provisional triage thresholds**, and the page is evidence of
+absent participation, not proof of a silent price path. Things to know:
 
-- **Core caps `getoraclesigners` at 1000 blocks**, about 25 epochs, so one window can never
-  show a 36-epoch drought. The monitor persists the newest epoch in which your slot appeared,
-  and on its first run a floor (the window's oldest epoch minus one). A slot never sighted
-  pages after 36 epochs of observation, as a stated lower bound.
-- **A network-wide bundle stall is not a drought.** If the newest bundle is more than 160
-  blocks behind the tip, nobody is signing; the check logs a degraded observation and neither
-  pages nor clears. Only a read with the drought below 36 clears an active alert.
+- **Core clamps `getoraclesigners` to 1 to 1000 blocks**, about 25 epochs at most, and the
+  scan reads every block of the window while holding the main chain lock, so the default
+  window is Core's own default of 100. One window can never show a 36-epoch drought: the
+  monitor persists the newest epoch in which your slot appeared and, on its first run, a floor
+  (the oldest epoch of that first window, which may be only partly covered). Drought is counted
+  from the later of the two. A slot never sighted pages after 36 epochs of observation, as a
+  lower bound of observation, not of chain history.
+- **Coverage.** The monitor also persists the last tip it processed. If the tip has advanced
+  more than the window since the last read, blocks were never scanned and your slot could have
+  signed in them; evidence restarts from the new window's oldest epoch (the floor is reset,
+  nothing is backfilled). At the default window and a five-minute cadence that happens after an
+  outage of the monitor longer than about 22 minutes. A state wipe does the same, and can let
+  the next read clear an active drought alert.
+- **Only mature bundles count**, at least 12 blocks below the tip, so a shallow reorg cannot
+  record a sighting the active chain lost. If the newest epoch the window shows is below the
+  newest epoch already processed, the read is unknown and state is untouched, so an active
+  alert cannot clear on a reorg.
+- **A stall is local.** If the newest mature bundle is more than 160 blocks behind your tip,
+  the check reads "no recent bundle on this node's chain": it neither pages nor clears, and once
+  that has persisted for an hour the monitor raises a separate degraded-observation warning
+  with the elapsed time, cleared by the next read that finds a recent bundle. It is not proof
+  that nobody is signing; a node that is itself lagging or stalled will not show it, and the
+  sync and fork checks own that case.
+- **Schema.** A read whose bundles lack an integer epoch, an integer height within the tip, a
+  non-empty array of integer `signer_ids`, or carry `bitmap_valid` false, is unknown as a whole,
+  in both monitors.
 
-It is a six-hour detection, not a fifteen-minute one. The network-view check above remains
-the fast path; what its miss should mean is under review against the observer data gathered
-on October 8 (the observer zeroes a slot's `last_update` whenever no price message has arrived
-since its last pending-message clear, which happens every few seconds to minutes, so a single
-zeroed read is not evidence of anything).
+Detection is about six hours at full bundle rate, not fifteen minutes. The network-view check
+above is bounded to what the observer can actually show (an old price timestamp); neither
+check is a proof, and the alert bodies say what to corroborate.
 
 ## "headers == blocks" is not "synced" when peers are far ahead (testnet fork, Sep–Oct 2026)
 
