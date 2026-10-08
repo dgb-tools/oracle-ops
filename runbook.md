@@ -114,16 +114,9 @@ Two v9.26.6 behaviors that will show up and are not understood as failures:
   node). It is a per-round sample, not a network health number. Heartbeats are the stable
   availability signal; price receipts per slot are read from `last_update`.
 
-The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`,
-`network_view_roster_stale_max` in the config): a miss is a successful read with a fresh heartbeat and
-a stale `last_update` *while the roster is mostly fresh*. If half or more of the roster reads stale at the
-same instant, that is a signing-round stall at the observer, not your silence, and it neither pages nor
-clears. A 15-minute, 30-second-resolution sample of all 35 slots on the oracle box on 2026-10-07 showed
-the roster's stale fraction swinging from 0% to 71% within minutes (median 34%); slot 29 read stale 16 of 30
-times, 8 of them during such stalls. A silent slot reads stale against a fresh roster for hours and still
-pages at fifteen minutes. Limitation: if the observing node itself is partitioned, the whole roster reads
-stale and this check goes quiet; the local checks (sync flag, tip age) and a second node or an explorer
-are the backstop. Otherwise the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
+The monitors in this kit now include this check (`network_view_url`, `network_view_stale_seconds`
+in the config): a miss is a successful read with a fresh heartbeat and a stale `last_update`;
+the alert fires after three consecutive misses spanning at least fifteen minutes; a failed
 fetch, a non-JSON body or an incomplete roster is never a miss and can never fire or clear an
 alert: pending evidence is reset and any active alert is left standing until a good read. The alert
 asks you to corroborate; it does not tell you to cycle on the first read.
@@ -145,12 +138,14 @@ which is a candidate for a validation-state divergence and nothing more.
 - **What the kit checks** (both monitors, local `getpeerinfo` only): whether your *headers*
   trail what connected peers *claim*. `startingheight` is a peer's claim at connect, not a
   lower bound on the valid chain, so one peer cannot set it: at least two peers
-  (`fork_min_peers`) must claim more than 100 blocks (`fork_gap_blocks`) above your headers,
-  for three consecutive five-minute cycles, while your headers advance by fewer than 100
-  blocks per cycle (`fork_progress_blocks`). A normal sync from behind advances far faster
-  than that, and a chain at 15-second blocks adds about 20 per cycle, so a branch that merely
-  keeps pace does not count as catching up. The three numbers are triage thresholds, not
-  correctness boundaries. `synced_headers` is not used: per Core's help text it is "the last
+  (`fork_min_peers`) must claim more than 100 blocks (`fork_gap_blocks`) above your headers
+  for three consecutive stuck cycles, where stuck means your headers advanced by fewer than
+  100 blocks (`fork_progress_blocks`) since the previous cycle. A normal sync from behind
+  advances far faster than that, and a chain at 15-second blocks adds about 20 per cycle, so
+  a branch that merely keeps pace does not count as catching up. The first read after a cold
+  start has no persisted headers sample to measure progress against and is unknown, so a dead
+  branch pages on the fourth read, 15 minutes after the first; the sample survives monitor
+  restarts. The three numbers are triage thresholds, not correctness boundaries. `synced_headers` is not used: per Core's help text it is "the last
   header we have in common with this peer", so it can never exceed yours and cannot show a
   dead branch.
 - **What the alert says** depends on what the node looks like locally. If it reports
@@ -161,8 +156,11 @@ which is a candidate for a validation-state divergence and nothing more.
   instruction is the same: investigate why local headers trail peer claims. A node that is
   catching up is not alerted on; a node with no peer data is unknown, which resets pending
   evidence and never pages or clears.
-- **Only a within-gap read clears the alert.** Unknown, catch-up and pending reads leave an
-  active alert standing; a streak reset is not a recovery.
+- **Only a within-gap read with local header progress clears the alert.** If the peers that
+  claimed ahead simply disconnect and your headers have not moved, the read is unconfirmed
+  and the alert stands. Unknown, catch-up and pending reads leave it standing too; a streak
+  reset is not a recovery. Malformed peer data (a row without a numeric `startingheight`) is
+  no data in both monitors and can neither page nor clear.
 - **Fix, conditional:** `getchaintips`; a tip with `status: invalid` at a height above yours is
   the signal. Confirm with a node you trust, or an explorer, that the invalid tip's hash is on
   the real chain, and confirm your software is at the version the active rules require,
@@ -171,7 +169,8 @@ which is a candidate for a validation-state divergence and nothing more.
   that is one observation, not a rule.
 - **Known limit, and the kit has no backstop for it:** a node whose peers are all on the same
   dead branch will not trip this check, and peers that all claim wrong heights would mis-trip
-  it. The backstop is outside the kit: a second node, an explorer, or `getchaintips` on a node
+  it; a slowly advancing dead branch whose ahead peers disconnect at the same moment could
+  clear it falsely. The backstop is outside the kit: a second node, an explorer, or `getchaintips` on a node
   you trust. The network-view check is not a backstop here: it reads the mainnet observer's
   price receipts, not chain agreement, and a testnet node on a dead branch keeps heartbeating,
   since heartbeats do not need blocks.

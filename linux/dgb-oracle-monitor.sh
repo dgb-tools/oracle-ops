@@ -80,7 +80,6 @@ cli_testnet() { "$CLI_EXE" -datadir="$DATADIR" -testnet "$@" 2>/dev/null; }
 # Unauthenticated, no published rate limit: query it only at this monitor's cadence.
 NETVIEW_URL="${NETVIEW_URL:-https://digibyte.io/api/getoracles}"
 NETVIEW_STALE_SECONDS="${NETVIEW_STALE_SECONDS:-3600}"   # last_update older than this with a fresh heartbeat = miss
-NETVIEW_ROSTER_STALE_MAX="${NETVIEW_ROSTER_STALE_MAX:-50}"  # percent; if this many slots or more read stale too, it is a network round stall, not our silence
 FORK_GAP_BLOCKS="${FORK_GAP_BLOCKS:-100}"        # a peer "claims ahead" when its startingheight exceeds our headers by more than this (triage threshold)
 FORK_MIN_PEERS="${FORK_MIN_PEERS:-2}"            # this many peers must claim ahead at once; one erroneous peer cannot set the maximum
 FORK_PROGRESS_BLOCKS="${FORK_PROGRESS_BLOCKS:-100}"  # headers advancing by at least this per cycle is a catch-up, not a stall
@@ -89,22 +88,30 @@ FORK_PROGRESS_BLOCKS="${FORK_PROGRESS_BLOCKS:-100}"  # headers advancing by at l
 # startingheight is a peer's claim at connect, not a lower bound on the valid chain, so one peer cannot set it:
 # FORK_MIN_PEERS peers must each claim more than FORK_GAP_BLOCKS above our headers. synced_headers is not used:
 # per Core's help text it is "the last header we have in common with this peer", so it can never exceed ours.
-# fork_peers_ahead (pure): args peers_json ourheaders gap -> FK_PEERS_OK(1|0) FK_PEERS_N FK_AHEAD_N FK_CLAIM(max)
+# fork_peers_ahead (pure): args peers_json ourheaders gap -> FK_PEERS_OK(1|0) FK_PEERS_N FK_AHEAD_N FK_CLAIM(max).
+# Any row without a numeric startingheight makes the whole read "no data" (same rule as the PowerShell monitor), so
+# malformed peer data can neither page nor clear.
 fork_peers_ahead() {
   local out
-  out=$(jq -r --argjson o "$2" --argjson g "$3" 'if type=="array" and length>0 then
+  out=$(jq -r --argjson o "$2" --argjson g "$3" 'if type=="array" and length>0 and all(.[]; type=="object" and (.startingheight|type=="number")) then
           ([.[] | (.startingheight // 0)]) as $sh | "1 \(length) \([$sh[] | select(. > $o + $g)] | length) \($sh | max)"
         else "0 0 0 0" end' <<< "$1" 2>/dev/null || echo "0 0 0 0")
   read -r FK_PEERS_OK FK_PEERS_N FK_AHEAD_N FK_CLAIM <<< "$out"
   case "$FK_PEERS_OK" in 1) ;; *) FK_PEERS_OK=0; FK_PEERS_N=0; FK_AHEAD_N=0; FK_CLAIM=0 ;; esac
 }
 # fork_update (pure except for state files). Outcomes (FK_OUTCOME):
-#  unknown = no peer data, or no previous headers sample to measure progress against: pending reset, alert untouched.
-#  ok      = fewer than FORK_MIN_PEERS peers claim ahead: the ONLY outcome that clears an alert.
-#  catchup = enough peers claim ahead but our headers advanced >= FORK_PROGRESS_BLOCKS since the previous cycle
-#            (a sync from behind moves far faster; a chain at 15 s blocks adds ~20 per 5-minute cycle, so a branch
-#            that merely keeps chain pace is not catching up): pending reset, alert untouched.
-#  stuck   = enough peers claim ahead and our headers did not advance: pending evidence; the 3rd consecutive FIRES.
+#  unknown     = no peer data, or no persisted headers sample to measure progress against (the first read after a
+#                cold start; the sample survives monitor restarts): pending reset, alert untouched.
+#  ok          = fewer than FORK_MIN_PEERS peers claim ahead AND our headers advanced since the previous cycle: the
+#                ONLY outcome that clears an alert.
+#  unconfirmed = fewer than FORK_MIN_PEERS peers claim ahead but our headers did not move: the corroborating peers
+#                may simply have disconnected, so this neither pages nor clears. Pending reset, alert untouched.
+#  catchup     = enough peers claim ahead but our headers advanced >= FORK_PROGRESS_BLOCKS since the previous cycle
+#                (a sync from behind moves far faster; a chain at 15 s blocks adds ~20 per 5-minute cycle, so a
+#                branch that merely keeps chain pace is not catching up): pending reset, alert untouched.
+#  stuck       = enough peers claim ahead and our headers advanced less than FORK_PROGRESS_BLOCKS (below the
+#                threshold, not necessarily zero): pending evidence; the 3rd consecutive FIRES, i.e. the 4th read
+#                after a cold start, 15 minutes after the first at the 5-minute cadence.
 #  FK_CLASS on fire: deadbranch when the node looks synced locally (ibd=false and headers-blocks < 10), the pattern
 #            of the incident, urgent; stalledsync otherwise (still in IBD, or headers far ahead of blocks), normal
 #            priority, no reconsiderblock advice. Neither is a diagnosis: both say "investigate why local headers
@@ -113,7 +120,7 @@ fork_peers_ahead() {
 #            getchaintips elsewhere is the backstop. The network-view check is not one: it reads the mainnet
 #            observer's price receipts, not chain agreement.
 # args: key readok ahead_n ourheaders ibd lag [min_peers] [progress_blocks]
-#  -> FK_OUTCOME FK_FIRE FK_CLASS FK_STREAK FK_PROGRESS
+#  -> FK_OUTCOME (unknown|ok|unconfirmed|catchup|stuck) FK_FIRE FK_CLASS FK_STREAK FK_PROGRESS
 fork_update() {
   local key="$1" readok="$2" an="$3" ours="$4" ibd="$5" lag="$6" minp="${7:-${FORK_MIN_PEERS:-2}}" prog="${8:-${FORK_PROGRESS_BLOCKS:-100}}" m prev
   m=$(state_get "$key" 0); prev=$(state_get "$key-hdr" ""); FK_OUTCOME=unknown; FK_FIRE=0; FK_CLASS=""; FK_STREAK=0; FK_PROGRESS=0
@@ -124,9 +131,12 @@ fork_update() {
   state_set "$key-hdr" "$ours"
   case "$prev" in ''|*[!0-9]*) prev="" ;; esac
   if [ "$readok" != "1" ]; then state_set "$key" 0; return 0; fi
-  if [ "$an" -lt "$minp" ]; then FK_OUTCOME=ok; state_set "$key" 0; return 0; fi
   if [ -z "$prev" ]; then state_set "$key" 0; return 0; fi
   FK_PROGRESS=$((ours - prev))
+  if [ "$an" -lt "$minp" ]; then
+    if [ "$FK_PROGRESS" -ge 1 ]; then FK_OUTCOME=ok; else FK_OUTCOME=unconfirmed; fi
+    state_set "$key" 0; return 0
+  fi
   if [ "$FK_PROGRESS" -ge "$prog" ]; then FK_OUTCOME=catchup; state_set "$key" 0; return 0; fi
   FK_OUTCOME=stuck; m=$((m + 1)); state_set "$key" "$m"; FK_STREAK=$m
   if [ "$m" -ge 3 ]; then
@@ -151,21 +161,20 @@ netview_validate() {
 
 # Network-view state machine (pure except for the state files). Rules, per crew review 2026-10-06/07.
 # Outcomes (NV_OUTCOME): miss | hit | outofscope | unknown
-#  miss       = read ok, heartbeat fresh, last_update is the "never received" sentinel (0/missing) or
+#  miss       = read ok, heartbeat fresh, last_update is the explicit 0 "never received" sentinel (missing or
+#               null is a schema failure that never reaches this machine) or
 #               older than $5 seconds. Pending evidence accrues.
 #  hit        = read ok, heartbeat fresh, last_update within $5 seconds: CONFIRMED recovery; clears
 #               pending evidence and is the only outcome that may clear an active alert.
 #  outofscope = read ok but heartbeat not fresh (node down, restarting, loading): says nothing about the
 #               price path. Pending evidence reset; alert state untouched.
-#  roundstall = our slot reads stale but at least NETVIEW_ROSTER_STALE_MAX percent of the roster reads stale
-#               too (a signing-round stall at the observer, not our silence): pending evidence reset, alert untouched.
 #  unknown    = read not ok, or last_update malformed or in the future (> now + 300 s): pending evidence
 #               reset; alert state untouched. Never a miss, never a hit.
 #  FIRE only on a miss that is the 3rd+ consecutive AND >= 900 s after the first of the streak.
-# args: readok(1|0) heartbeat_status last_update_raw now stale_seconds [roster_stale_percent]
+# args: readok(1|0) heartbeat_status last_update_raw now stale_seconds
 #  -> NV_OUTCOME NV_FIRE NV_STREAK NV_AGE NV_MINUTES
 netview_update() {
-  local readok="$1" hb="$2" lu="$3" now="$4" stale="$5" rfrac="${6:-0}" streak since
+  local readok="$1" hb="$2" lu="$3" now="$4" stale="$5" streak since
   streak=$(state_get net-miss 0); since=$(state_get net-miss-since "$now")
   NV_OUTCOME=unknown; NV_FIRE=0; NV_STREAK=0; NV_AGE=-1; NV_MINUTES=0
   if [ "$readok" != "1" ]; then state_set net-miss 0; return 0; fi
@@ -173,7 +182,6 @@ netview_update() {
   case "$lu" in 0) NV_AGE=-1 ;; ''|null|*[!0-9]*) state_set net-miss 0; return 0 ;; *) NV_AGE=$((now - lu)); if [ "$NV_AGE" -lt -300 ]; then state_set net-miss 0; return 0; fi; [ "$NV_AGE" -lt 0 ] && NV_AGE=0 ;; esac
   if [ "$hb" != "fresh" ]; then NV_OUTCOME=outofscope; state_set net-miss 0; return 0; fi
   if [ "$NV_AGE" -lt 0 ] || [ "$NV_AGE" -gt "$stale" ]; then NV_OUTCOME=miss; else NV_OUTCOME=hit; fi
-  if [ "$NV_OUTCOME" = "miss" ] && [ "$rfrac" -ge "${NETVIEW_ROSTER_STALE_MAX:-50}" ]; then NV_OUTCOME=roundstall; state_set net-miss 0; return 0; fi
   if [ "$NV_OUTCOME" = "miss" ]; then [ "$streak" = "0" ] && since=$now; streak=$((streak + 1)); else streak=0; since=$now; fi
   state_set net-miss "$streak"; state_set net-miss-since "$since"; state_set net-last-ok-read "$now"
   NV_STREAK=$streak; NV_MINUTES=$(( (now - since) / 60 ))
@@ -280,16 +288,17 @@ No systemd service configured - log in and start the daemon, or install digibyte
   fork_update "$label-fork-miss" "$FK_PEERS_OK" "$FK_AHEAD_N" "$headers" "$ibd" "$lag" "$FORK_MIN_PEERS" "$FORK_PROGRESS_BLOCKS"
   case "$FK_OUTCOME" in
     ok) report_check "$label-fork" 1 "" "" ;;
+    unconfirmed) log "fork: fewer than $FORK_MIN_PEERS peers claim ahead but headers=$headers did not move this cycle; unconfirmed (corroborating peers may have disconnected); alert state untouched" ;;
     stuck)
       summary="$summary PEERS_AHEAD=$FK_AHEAD_N/$FK_PEERS_N"
       if [ "$FK_FIRE" != "1" ]; then
         log "fork: stuck $FK_STREAK/3 ($FK_AHEAD_N of $FK_PEERS_N peers claim more than $FORK_GAP_BLOCKS above headers=$headers, highest claim $FK_CLAIM; headers +$FK_PROGRESS this cycle); alert state untouched"
       elif [ "$FK_CLASS" = "deadbranch" ]; then
         report_check "$label-fork" 0 "DGB oracle box: $label headers trail peer claims while the node looks synced (dead-branch candidate)" \
-          "Our headers=$headers advanced $FK_PROGRESS blocks since the previous check while $FK_AHEAD_N of $FK_PEERS_N connected peers claim a startingheight more than $FORK_GAP_BLOCKS above them (highest claim $FK_CLAIM), for $FK_STREAK consecutive checks, and this node reports ibd=false with headers within 10 of blocks: locally it looks synced. Local headers that trail peer claims and do not advance are consistent with a dead branch (a stored invalid mark, for example after crossing an activation on old software) and also with stale or wrong peer claims. Investigate why local headers trail peer claims before changing anything: digibyte-cli getchaintips; a tip with status=invalid above our height is the signal. Confirm with a node you trust or an explorer that the invalid tip's hash is on the real chain, and that this node's software is at the version the active rules require (otherwise it rejects the block again). Only then: reconsiderblock <hash>. On the oracle box on 2026-10-07 the reorg completed in about 90 s (one observation). Tip-age thresholds do not catch this." urgent
+          "Our headers=$headers advanced $FK_PROGRESS blocks since the previous check while $FK_AHEAD_N of $FK_PEERS_N connected peers claim a startingheight more than $FORK_GAP_BLOCKS above them (highest claim $FK_CLAIM), for $FK_STREAK consecutive checks (progress below the $FORK_PROGRESS_BLOCKS-block threshold), and this node reports ibd=false with headers within 10 of blocks: locally it looks synced. Local headers that trail peer claims and stay below the progress threshold are consistent with a dead branch (a stored invalid mark, for example after crossing an activation on old software) and also with stale or wrong peer claims. Investigate why local headers trail peer claims before changing anything: digibyte-cli getchaintips; a tip with status=invalid above our height is the signal. Confirm with a node you trust or an explorer that the invalid tip's hash is on the real chain, and that this node's software is at the version the active rules require (otherwise it rejects the block again). Only then: reconsiderblock <hash>. On the oracle box on 2026-10-07 the reorg completed in about 90 s (one observation). Tip-age thresholds do not catch this." urgent
       else
-        report_check "$label-fork" 0 "DGB oracle box: $label headers trail peer claims and are not advancing (stalled sync)" \
-          "Our headers=$headers advanced $FK_PROGRESS blocks since the previous check while $FK_AHEAD_N of $FK_PEERS_N connected peers claim a startingheight more than $FORK_GAP_BLOCKS above them (highest claim $FK_CLAIM), for $FK_STREAK consecutive checks, and this node reports ibd=$ibd with headers-blocks=$lag: it does not look synced locally. This is a stalled sync, not a dead-branch finding. Investigate why local headers trail peer claims (peer connectivity, disk, a sync that stopped). Do not run reconsiderblock on this evidence." high
+        report_check "$label-fork" 0 "DGB oracle box: $label headers trail peer claims and stay below the progress threshold (stalled sync)" \
+          "Our headers=$headers advanced $FK_PROGRESS blocks since the previous check while $FK_AHEAD_N of $FK_PEERS_N connected peers claim a startingheight more than $FORK_GAP_BLOCKS above them (highest claim $FK_CLAIM), for $FK_STREAK consecutive checks (progress below the $FORK_PROGRESS_BLOCKS-block threshold), and this node reports ibd=$ibd with headers-blocks=$lag: it does not look synced locally. This is a stalled sync, not a dead-branch finding. Investigate why local headers trail peer claims (peer connectivity, disk, a sync that stopped). Do not run reconsiderblock on this evidence." high
       fi ;;
     catchup) log "fork: $FK_AHEAD_N of $FK_PEERS_N peers claim more than $FORK_GAP_BLOCKS above headers=$headers but headers advanced +$FK_PROGRESS this cycle (catching up); pending evidence reset, alert state untouched" ;;
     *) log "fork detector unknown (no peer data, or no progress baseline yet); pending evidence reset, alert state untouched" ;;
@@ -357,21 +366,17 @@ digibyte-cli -testnet=0 -chain=main -rpcwallet=$ORACLE_WALLET startoracle $ORACL
       nraw=$(curl -fsS -m 20 -H "User-Agent: dgb-oracle-monitor (slot $ORACLE_ID)" -H 'Accept: application/json' "$NETVIEW_URL" 2>/dev/null || true)
       nvalid=$(netview_validate "$nraw")
       nme=""; [ "$nvalid" = "ok" ] && nme=$(jq -c --argjson id "$ORACLE_ID" '[.[] | select(.oracle_id == $id)] | first // empty' <<< "$nraw" 2>/dev/null)
-      local nrfrac=0
-      if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme")
-        nrfrac=$(jq -r --argjson now "$NOW" --argjson st "$NETVIEW_STALE_SECONDS" '[.[] | select(.last_update == 0 or ($now - .last_update) > $st)] | length * 100 / 35 | floor' <<< "$nraw" 2>/dev/null || echo 0)
-      else nhb=""; nlu=""; fi
-      netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS" "$nrfrac"
+      if [ -n "$nme" ]; then readok=1; nhb=$(jq -r '.heartbeat_status // ""' <<< "$nme"); nlu=$(jq -r '.last_update // ""' <<< "$nme"); else nhb=""; nlu=""; fi
+      netview_update "$readok" "$nhb" "$nlu" "$NOW" "$NETVIEW_STALE_SECONDS"
       case "$NV_OUTCOME" in
         miss|hit)
           local netok=1; [ "$NV_FIRE" = "1" ] && netok=0
           if [ "$NV_OUTCOME" = "hit" ] || [ "$NV_FIRE" = "1" ]; then   # a miss that is not yet firing makes no call, so an active alert stands
           report_check "$label-oracle$ORACLE_ID-networkview" "$netok" "DGB ORACLE $ORACLE_ID NOT OBSERVED BY THE NETWORK-VIEW NODE" \
-            "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes (roster ${nrfrac}% stale at the last read), while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
+            "The observer at $NETVIEW_URL has not received a price from slot $ORACLE_ID for ${NV_AGE}s (heartbeat $nhb, status $(jq -r '.status // "?"' <<< "$nme"), price_source $(jq -r '.price_source // "?"' <<< "$nme")) across $NV_STREAK consecutive reads over $NV_MINUTES minutes, while this node reports ${detail}. This is one observer's view, not network proof. Corroborate first: read the same URL again in 15 minutes and check your own listoracle. If last_update stays stale with a fresh heartbeat, the price broadcast is likely silent; the runbook's 'after any restart or upgrade' section gives the stop/start fix." urgent
           fi
           summary="$summary net-o$ORACLE_ID=$NV_OUTCOME/lu${NV_AGE}s" ;;
         outofscope) summary="$summary net-o$ORACLE_ID=hb-$nhb"; log "netview: heartbeat $nhb at the observer; price path not assessed, alert state untouched" ;;
-        roundstall) summary="$summary net-o$ORACLE_ID=roundstall/${nrfrac}%"; log "netview: our slot stale but ${nrfrac}% of the roster stale at the observer; signing-round stall, not our silence; alert state untouched" ;;
         *) if [ "$nvalid" != "ok" ]; then log "netview check unknown (pending evidence reset, alert state untouched): roster failed schema/completeness check from $NETVIEW_URL"
            elif [ -z "$nme" ]; then log "netview check unknown: slot $ORACLE_ID absent; configuration or response completeness unconfirmed ($NETVIEW_URL)"
            else log "netview check unknown: last_update malformed or in the future for slot $ORACLE_ID (pending evidence reset, alert state untouched)"; fi ;;
@@ -395,9 +400,9 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case() { # name; then steps "readok:hb:age|none|future|bad:offset:expectFire:expectAlertAfter"
     local name="$1"; shift; local ok=1 trace="" alert=0; rm -f "$STATE"/net-*; total=$((total + 1))
     for step in "$@"; do
-      IFS=: read -r ro hb age off expf expa rf <<< "$step"; local lu=""; rf="${rf:-0}"
+      IFS=: read -r ro hb age off expf expa <<< "$step"; local lu=""
       case "$age" in zero) lu=0 ;; none) lu="" ;; future) lu=$((t0 + off + 3600)) ;; soon) lu=$((t0 + off + 120)) ;; bad) lu="12abc" ;; *) lu=$((t0 + off - age)) ;; esac
-      netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600 "$rf"
+      netview_update "$ro" "$hb" "$lu" "$((t0 + off))" 3600
       # caller wiring under test: alert set only on fire; cleared only on hit; otherwise untouched
       if [ "$NV_FIRE" = "1" ]; then alert=1; elif [ "$NV_OUTCOME" = "hit" ]; then alert=0; fi
       trace="$trace t+${off}s $NV_OUTCOME fire=$NV_FIRE alert=$alert |"
@@ -417,9 +422,6 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_case "active alert survives a stale heartbeat (restart does not count as recovery)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:stale:5200:1200:0:1 1:stale:5500:1500:0:1
   run_case "malformed and future timestamps are unknown: never fire, never clear" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:bad:1200:0:1 1:fresh:future:1500:0:1
   run_case "last_update slightly in the future (<= 300 s) clamps to age 0 and is a hit, never a miss" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:soon:1200:0:0
-  run_case "stale while the roster is mostly stale (round stall) never fires" 1:fresh:4000:0:0:0:60 1:fresh:4300:300:0:0:71 1:fresh:4600:600:0:0:55 1:fresh:4900:900:0:0:50 1:fresh:5200:1200:0:0:64
-  run_case "stale while the roster is fresh fires; a round-stall read in the middle resets pending evidence" 1:fresh:4000:0:0:0:3 1:fresh:4300:300:0:0:34 1:fresh:4600:600:0:0:60 1:fresh:4900:900:0:0:10 1:fresh:5200:1200:0:0:0 1:fresh:5500:1500:0:0:20 1:fresh:5800:1800:1:1:30
-  run_case "an active alert survives round-stall reads (unconfirmed, not recovered)" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:5200:1200:0:1:70 1:fresh:5500:1500:0:1:55
   run_case "confirmed recovery clears the alert" 1:fresh:4000:0:0:0 1:fresh:4300:300:0:0 1:fresh:4600:600:0:0 1:fresh:4900:900:1:1 1:fresh:60:1200:0:0
   # validator against the shared fixtures
   fxdir="$(cd "$(dirname "$0")/.." && pwd)/test/netview-fixtures"
@@ -436,6 +438,8 @@ if [ "${1:-}" = "--netview-selftest" ]; then
   run_peers "fork peers: synced_headers is ignored" '[{"startingheight":1000,"synced_headers":9999},{"startingheight":1000,"synced_headers":9999}]' 1000 "1 2 0 1000"
   run_peers "fork peers: empty array is no data" '[]' 1000 "0 0 0 0"
   run_peers "fork peers: non-JSON is no data" 'garbage' 1000 "0 0 0 0"
+  run_peers "fork peers: a row without startingheight makes the read no data" '[{"startingheight":1500},{"addr":"x"}]' 1000 "0 0 0 0"
+  run_peers "fork peers: a non-numeric startingheight makes the read no data" '[{"startingheight":"1500"},{"startingheight":1500}]' 1000 "0 0 0 0"
   # fork detector transitions: steps "readok:ahead_n:ours:ibd:lag:expectOutcome:expectFire(0|deadbranch|stalledsync):expectAlertAfter"
   run_fork() { local name="$1"; shift; local ok=1 trace="" alert=0; rm -f "$STATE"/x-fork-miss "$STATE"/x-fork-miss-hdr; total=$((total + 1))
     for step in "$@"; do IFS=: read -r ro an ou ib lg expo expf expa <<< "$step"; fork_update x-fork-miss "$ro" "$an" "$ou" "$ib" "$lg" 2 100
@@ -444,13 +448,14 @@ if [ "${1:-}" = "--netview-selftest" ]; then
       trace="$trace $FK_OUTCOME/$fired/a$alert |"; { [ "$FK_OUTCOME" = "$expo" ] && [ "$fired" = "$expf" ] && [ "$alert" = "$expa" ]; } || ok=0; done
     if [ "$ok" = "1" ]; then echo "PASS  $name"; else fails=$((fails + 1)); echo "FAIL  $name:$trace"; fi; }
   run_fork "fork: first read is unknown (no baseline); stuck x3 fires deadbranch when the node looks synced" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1
-  run_fork "fork: one peer ahead is below the minimum: ok from the first read, never fires" 1:1:1000:false:0:ok:0:0 1:1:1000:false:0:ok:0:0 1:1:1000:false:0:ok:0:0 1:1:1000:false:0:ok:0:0 1:1:1000:false:0:ok:0:0
+  run_fork "fork: one peer ahead is below the minimum: unknown without a baseline, then ok while headers advance" 1:1:1000:false:0:unknown:0:0 1:1:1020:false:0:ok:0:0 1:1:1040:false:0:ok:0:0 1:1:1060:false:0:ok:0:0
+  run_fork "fork: ahead peers disconnect with no local progress: unconfirmed, alert retained; clears once headers advance" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 1:0:1000:false:0:unconfirmed:0:1 1:1:1000:false:0:unconfirmed:0:1 1:0:1020:false:0:ok:0:0
   run_fork "fork: advancing catch-up never fires" 1:2:1000:true:0:unknown:0:0 1:2:5000:true:3000:catchup:0:0 1:2:9000:true:2000:catchup:0:0 1:2:13000:true:1000:catchup:0:0 1:2:17000:false:5:catchup:0:0
   run_fork "fork: stuck in IBD fires stalledsync, not deadbranch" 1:2:1000:true:0:unknown:0:0 1:2:1000:true:0:stuck:0:0 1:2:1000:true:0:stuck:0:0 1:2:1000:true:0:stuck:stalledsync:1
   run_fork "fork: headers far ahead of blocks fires stalledsync" 1:2:1000:false:500:unknown:0:0 1:2:1000:false:500:stuck:0:0 1:2:1000:false:500:stuck:0:0 1:2:1000:false:500:stuck:stalledsync:1
   run_fork "fork: a catch-up read resets the streak; stuck counts again from 1" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1450:false:0:catchup:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:0:0 1:2:1450:false:0:stuck:deadbranch:1
-  run_fork "fork: an active alert survives unknown and the following stuck read (no false recovery); only ok clears" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 0:0:1000:false:0:unknown:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:deadbranch:1 1:0:1000:false:0:ok:0:0
-  run_fork "fork: catch-up does not clear an active alert" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 1:2:1500:false:0:catchup:0:1 1:0:1500:false:0:ok:0:0
+  run_fork "fork: an active alert survives unknown and the following stuck read (no false recovery); only ok clears" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 0:0:1000:false:0:unknown:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:0:1 1:2:1000:false:0:stuck:deadbranch:1 1:0:1020:false:0:ok:0:0
+  run_fork "fork: catch-up does not clear an active alert" 1:2:1000:false:0:unknown:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:0:0 1:2:1000:false:0:stuck:deadbranch:1 1:2:1500:false:0:catchup:0:1 1:0:1520:false:0:ok:0:0
   echo "netview self-test: $((total - fails))/$total passed"; rm -rf "$STATE"; exit $fails
 fi
 
